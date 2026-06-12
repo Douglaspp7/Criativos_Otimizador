@@ -1,0 +1,14 @@
+name = "criativo-judge"
+main = "src/index.js"
+compatibility_date = "2025-01-01"
+
+# Roda a análise automaticamente a cada 12 horas (horário UTC)
+[triggers]
+crons = ["0 6,18 * * *"]
+
+# Banco D1 — crie no painel do Cloudflare (Workers & Pages > D1)
+# e cole o database_id abaixo
+[[d1_databases]]
+binding = "DB"
+database_name = "criativo-judge"
+database_id = "COLE_O_ID_DO_BANCO_AQUI"
