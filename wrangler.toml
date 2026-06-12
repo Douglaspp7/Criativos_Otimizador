@@ -11,4 +11,4 @@ crons = ["0 6,18 * * *"]
 [[d1_databases]]
 binding = "DB"
 database_name = "criativo-judge"
-database_id = "COLE_O_ID_DO_BANCO_AQUI"
+database_id = "088d9a1f-a49a-4e94-98a8-1f65bbe05ac9"
