@@ -5,12 +5,12 @@
 // Secrets necessários (Settings > Variables do Worker):
 //   META_TOKEN        token de acesso (System User, ads_read)
 //   META_AD_ACCOUNT   id da conta no formato act_1234567890
-//   ANTHROPIC_API_KEY chave da API da Anthropic
+//   GEMINI_API_KEY    chave da API do Gemini
 //   DASH_KEY          senha do dashboard (você inventa uma)
 // ============================================================
 
 const META_API = "https://graph.facebook.com/v21.0";
-const PERIODO = "last_7d"; // janela das métricas
+const PERIODO = "today"; // janela das métricas
 const MAX_IMAGENS = 6;     // máx. de imagens enviadas à IA por análise
 
 export default {
@@ -83,7 +83,7 @@ async function runAnalysis(env) {
 
   let analysis = null;
   try {
-    analysis = await analyzeWithClaude(env, ads);
+    analysis = await analyzeWithGemini(env, ads);
   } catch (e) {
     analysis = { erro: "Falha na análise de IA: " + e.message };
   }
@@ -159,8 +159,8 @@ function rankAds(ads) {
   ads.forEach((a, idx) => (a.rank = idx + 1));
 }
 
-// Envia métricas + imagens dos criativos para o Claude e pede JSON
-async function analyzeWithClaude(env, ads) {
+// Envia métricas + imagens dos criativos para o Gemini e pede JSON
+async function analyzeWithGemini(env, ads) {
   const metricsTable = ads.map((a) => ({
     ad_id: a.id,
     nome: a.name,
@@ -177,51 +177,66 @@ async function analyzeWithClaude(env, ads) {
     cpa: a.cpa,
   }));
 
-  const content = [
+  const systemInstruction = 
+    "Você é um especialista em direct response e Meta Ads para produtos digitais low-ticket na LATAM. " +
+    "Analise o criativo vencedor (rank 1): o que na imagem, no título e na copy explica a performance? " +
+    "Depois diagnostique cada um dos demais e proponha melhorias concretas e acionáveis " +
+    "(ângulo, hook, elemento visual, prova, CTA). Considere fadiga quando a frequência for alta (>2,5).\n\n" +
+    "Responda SOMENTE com JSON válido, sem markdown, neste formato:\n" +
+    '{ "resumo": "visão geral em 2-3 frases", ' +
+    '"vencedor": { "ad_id": "...", "pontos_fortes": ["..."], "melhorias": ["..."] }, ' +
+    '"criativos": [ { "ad_id": "...", "diagnostico": "...", "melhorias": ["..."] } ] }';
+
+  const parts = [
     {
-      type: "text",
-      text:
-        "Você é um especialista em direct response e Meta Ads para produtos digitais low-ticket na LATAM. " +
-        "Abaixo estão as métricas dos últimos 7 dias dos anúncios ativos, já ranqueados (rank 1 = melhor, " +
-        "por menor CPA ou maior CTR). Em seguida, as imagens dos criativos na mesma ordem.\n\n" +
-        "MÉTRICAS:\n" + JSON.stringify(metricsTable, null, 2) + "\n\n" +
-        "Analise o criativo vencedor (rank 1): o que na imagem, no título e na copy explica a performance? " +
-        "Depois diagnostique cada um dos demais e proponha melhorias concretas e acionáveis " +
-        "(ângulo, hook, elemento visual, prova, CTA). Considere fadiga quando a frequência for alta (>2,5).\n\n" +
-        "Responda SOMENTE com JSON válido, sem markdown, neste formato:\n" +
-        '{ "resumo": "visão geral em 2-3 frases", ' +
-        '"vencedor": { "ad_id": "...", "pontos_fortes": ["..."], "melhorias": ["..."] }, ' +
-        '"criativos": [ { "ad_id": "...", "diagnostico": "...", "melhorias": ["..."] } ] }',
-    },
+      text: "Abaixo estão as métricas dos últimos 7 dias dos anúncios ativos, já ranqueados (rank 1 = melhor, por menor CPA ou maior CTR). Em seguida, as imagens dos criativos na mesma ordem.\n\nMÉTRICAS:\n" + JSON.stringify(metricsTable, null, 2)
+    }
   ];
 
   for (const a of ads.slice(0, MAX_IMAGENS)) {
     if (!a.image) continue;
-    content.push({ type: "text", text: "Imagem do criativo rank " + a.rank + " — " + a.name + " (ad_id " + a.id + "):" });
-    content.push({ type: "image", source: { type: "url", url: a.image } });
+    try {
+      const imgRes = await fetch(a.image);
+      const arrBuf = await imgRes.arrayBuffer();
+      
+      let binary = '';
+      const bytes = new Uint8Array(arrBuf);
+      const len = bytes.byteLength;
+      for (let i = 0; i < len; i++) {
+        binary += String.fromCharCode(bytes[i]);
+      }
+      const base64 = btoa(binary);
+
+      parts.push({ text: "Imagem do criativo rank " + a.rank + " — " + a.name + " (ad_id " + a.id + "):" });
+      parts.push({
+        inline_data: {
+          mime_type: "image/jpeg",
+          data: base64
+        }
+      });
+    } catch (e) {
+      console.error("Erro ao baixar imagem do ad " + a.id + ": ", e);
+    }
   }
 
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
+  const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro-latest:generateContent?key=${env.GEMINI_API_KEY}`, {
     method: "POST",
     headers: {
       "content-type": "application/json",
-      "x-api-key": env.ANTHROPIC_API_KEY,
-      "anthropic-version": "2023-06-01",
     },
     body: JSON.stringify({
-      model: "claude-sonnet-4-6",
-      max_tokens: 3000,
-      messages: [{ role: "user", content }],
+      contents: [{ parts }],
+      system_instruction: { parts: [{ text: systemInstruction }] },
+      generationConfig: {
+        responseMimeType: "application/json"
+      }
     }),
   });
 
   const data = await res.json();
-  if (data.error) throw new Error("Anthropic API: " + data.error.message);
+  if (data.error) throw new Error("Gemini API: " + data.error.message);
 
-  const text = (data.content || [])
-    .filter((b) => b.type === "text")
-    .map((b) => b.text)
-    .join("\n");
+  const text = data.candidates?.[0]?.content?.parts?.[0]?.text || "{}";
   const clean = text.replace(/```json|```/g, "").trim();
 
   try {
@@ -343,7 +358,11 @@ const HTML = `<!DOCTYPE html>
     runbtn.disabled = true; runbtn.textContent = "Analisando...";
     fetch("/api/run?key=" + encodeURIComponent(KEY), { method: "POST" })
       .then(function(r){ return r.json(); })
-      .then(function(){ runbtn.disabled = false; runbtn.textContent = "Rodar análise"; load(); })
+      .then(function(res){ 
+        if (res.error) alert(res.error);
+        runbtn.disabled = false; runbtn.textContent = "Rodar análise"; 
+        load(); 
+      })
       .catch(function(){ runbtn.disabled = false; runbtn.textContent = "Rodar análise"; });
   };
 
