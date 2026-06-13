@@ -10,7 +10,7 @@
 // ============================================================
 
 const META_API = "https://graph.facebook.com/v21.0";
-const PERIODO = "lifetime"; // janela das métricas (desde que o anúncio foi criado)
+const PERIODO = "maximum"; // janela das métricas (desde que o anúncio foi criado)
 const MAX_IMAGENS = 6;     // máx. de imagens enviadas à IA por análise
 
 export default {
