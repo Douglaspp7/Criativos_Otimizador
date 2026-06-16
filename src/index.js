@@ -118,6 +118,14 @@ export default {
 async function runAnalysis(env) {
   await ensureSchema(env);
 
+  const m = meta(env);
+  if (!m.token) {
+    return { ok: false, error: "META_TOKEN ausente ou vazio — cole no secret do Cloudflare um token de System User com ads_read." };
+  }
+  if (!m.account.startsWith("act_")) {
+    return { ok: false, error: "META_AD_ACCOUNT inválido — use o formato act_1234567890 (com o prefixo act_)." };
+  }
+
   const [account, campaigns, ads] = await Promise.all([
     fetchAccountInsights(env),
     fetchCampaignInsights(env),
@@ -170,13 +178,14 @@ async function runAnalysis(env) {
 
 // Insights agregados da conta inteira no período
 async function fetchAccountInsights(env) {
+  const { token, account } = meta(env);
   const fields =
     "spend,impressions,clicks,ctr,cpc,cpm,frequency,actions,action_values,purchase_roas";
   const url =
-    META_API + "/" + env.META_AD_ACCOUNT + "/insights" +
+    META_API + "/" + account + "/insights" +
     "?level=account&date_preset=" + PERIODO +
     "&fields=" + encodeURIComponent(fields) +
-    "&access_token=" + env.META_TOKEN;
+    "&access_token=" + token;
 
   const res = await fetch(url);
   const data = await res.json();
@@ -189,12 +198,13 @@ async function fetchAccountInsights(env) {
 
 // Série diária da conta (uma linha por dia) para a tendência real
 async function fetchDailySeries(env) {
+  const { token, account } = meta(env);
   const fields = "spend,actions,action_values,purchase_roas";
   const url =
-    META_API + "/" + env.META_AD_ACCOUNT + "/insights" +
+    META_API + "/" + account + "/insights" +
     "?level=account&time_increment=1&date_preset=last_" + DIAS_TENDENCIA + "d" +
     "&fields=" + encodeURIComponent(fields) +
-    "&limit=" + (DIAS_TENDENCIA + 2) + "&access_token=" + env.META_TOKEN;
+    "&limit=" + (DIAS_TENDENCIA + 2) + "&access_token=" + token;
 
   const res = await fetch(url);
   const data = await res.json();
@@ -216,13 +226,14 @@ async function fetchDailySeries(env) {
 
 // Insights por campanha (uma linha por campanha)
 async function fetchCampaignInsights(env) {
+  const { token, account } = meta(env);
   const fields =
     "campaign_id,campaign_name,spend,impressions,clicks,ctr,cpc,cpm,frequency,actions,action_values,purchase_roas";
   const url =
-    META_API + "/" + env.META_AD_ACCOUNT + "/insights" +
+    META_API + "/" + account + "/insights" +
     "?level=campaign&date_preset=" + PERIODO +
     "&fields=" + encodeURIComponent(fields) +
-    "&limit=200&access_token=" + env.META_TOKEN;
+    "&limit=200&access_token=" + token;
 
   const res = await fetch(url);
   const data = await res.json();
@@ -240,6 +251,7 @@ async function fetchCampaignInsights(env) {
 
 // Busca anúncios ativos com insights + criativo na Meta Marketing API
 async function fetchAds(env) {
+  const { token, account } = meta(env);
   const fields =
     "name,effective_status," +
     "creative{image_url,thumbnail_url,body,title}," +
@@ -249,10 +261,10 @@ async function fetchAds(env) {
   ]);
 
   const url =
-    META_API + "/" + env.META_AD_ACCOUNT + "/ads" +
+    META_API + "/" + account + "/ads" +
     "?fields=" + encodeURIComponent(fields) +
     "&filtering=" + encodeURIComponent(filtering) +
-    "&limit=50&access_token=" + env.META_TOKEN;
+    "&limit=50&access_token=" + token;
 
   const res = await fetch(url);
   const data = await res.json();
@@ -465,6 +477,12 @@ async function ensureSchema(env) {
       /* coluna já existe */
     }
   }
+}
+
+// Lê e normaliza credenciais da Meta (remove espaços/aspas/quebras coladas por engano)
+function meta(env) {
+  const clean = (v) => String(v || "").trim().replace(/^["']|["']$/g, "");
+  return { token: clean(env.META_TOKEN), account: clean(env.META_AD_ACCOUNT) };
 }
 
 function pickAction(actions, types) {
