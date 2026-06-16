@@ -15,6 +15,11 @@ const PERIODO = "maximum"; // janela das métricas (date_preset da Meta)
 const MAX_IMAGENS = 6;     // máx. de imagens enviadas à IA por análise
 const MAX_CAMPANHAS = 15;  // máx. de campanhas mandadas à IA / mostradas
 
+// Senha do dashboard. Troque o valor abaixo pela sua senha — é só isso.
+// (Se você preferir, pode definir um secret DASH_KEY no Cloudflare; quando
+//  ele existe, tem prioridade sobre esta. Mas não é obrigatório.)
+const DASH_KEY = "troque-esta-senha";
+
 // Tipos de ação que contam como conversão (compra ou lead)
 const CONV_TYPES = [
   "purchase",
@@ -45,8 +50,9 @@ export default {
     }
 
     if (url.pathname.startsWith("/api/")) {
+      const expected = env.DASH_KEY || DASH_KEY;
       const key = url.searchParams.get("key") || request.headers.get("x-dash-key");
-      if (!env.DASH_KEY || key !== env.DASH_KEY) {
+      if (!expected || key !== expected) {
         return json({ error: "Chave de acesso inválida." }, 401);
       }
       await ensureSchema(env);
