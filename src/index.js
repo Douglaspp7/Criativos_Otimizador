@@ -36,6 +36,14 @@ const VALUE_TYPES = [
   "offsite_conversion.fb_pixel_purchase",
   "onsite_web_purchase",
 ];
+// Initiate Checkout — evento-ponte para ler intenção quando há poucas compras
+const IC_TYPES = [
+  "initiate_checkout",
+  "omni_initiated_checkout",
+  "offsite_conversion.fb_pixel_initiate_checkout",
+  "onsite_web_initiate_checkout",
+];
+const DIAS_TENDENCIA = 30; // dias na série de tendência diária (time_increment=1)
 
 export default {
   async scheduled(event, env, ctx) {
@@ -65,6 +73,7 @@ export default {
             created_at: row.created_at,
             account: safeParse(row.account_json),
             campaigns: safeParse(row.campaigns_json) || [],
+            daily: safeParse(row.daily_json) || [],
             ads: JSON.parse(row.metrics_json),
             analysis: safeParse(row.analysis_json),
           });
@@ -120,6 +129,13 @@ async function runAnalysis(env) {
   rankAds(ads);
   campaigns.sort((a, b) => b.spend - a.spend);
 
+  let daily = [];
+  try {
+    daily = await fetchDailySeries(env);
+  } catch (e) {
+    console.error("Tendência diária:", e.message);
+  }
+
   let analysis = null;
   try {
     analysis = await analyzeWithGemini(env, account, campaigns, ads);
@@ -129,12 +145,13 @@ async function runAnalysis(env) {
 
   await env.DB
     .prepare(
-      "INSERT INTO runs (created_at, account_json, campaigns_json, metrics_json, analysis_json) VALUES (?, ?, ?, ?, ?)"
+      "INSERT INTO runs (created_at, account_json, campaigns_json, daily_json, metrics_json, analysis_json) VALUES (?, ?, ?, ?, ?, ?)"
     )
     .bind(
       new Date().toISOString(),
       JSON.stringify(account),
       JSON.stringify(campaigns),
+      JSON.stringify(daily),
       JSON.stringify(ads),
       JSON.stringify(analysis)
     )
@@ -152,7 +169,7 @@ async function runAnalysis(env) {
 // Insights agregados da conta inteira no período
 async function fetchAccountInsights(env) {
   const fields =
-    "spend,impressions,clicks,ctr,cpc,cpm,frequency,actions,action_values";
+    "spend,impressions,clicks,ctr,cpc,cpm,frequency,actions,action_values,purchase_roas";
   const url =
     META_API + "/" + env.META_AD_ACCOUNT + "/insights" +
     "?level=account&date_preset=" + PERIODO +
@@ -168,10 +185,37 @@ async function fetchAccountInsights(env) {
   return Object.assign({ name: "Conta inteira" }, computeFromInsight(row));
 }
 
+// Série diária da conta (uma linha por dia) para a tendência real
+async function fetchDailySeries(env) {
+  const fields = "spend,actions,action_values,purchase_roas";
+  const url =
+    META_API + "/" + env.META_AD_ACCOUNT + "/insights" +
+    "?level=account&time_increment=1&date_preset=last_" + DIAS_TENDENCIA + "d" +
+    "&fields=" + encodeURIComponent(fields) +
+    "&limit=" + (DIAS_TENDENCIA + 2) + "&access_token=" + env.META_TOKEN;
+
+  const res = await fetch(url);
+  const data = await res.json();
+  if (data.error) throw new Error("Meta API (tendência): " + data.error.message);
+
+  return (data.data || []).map((d) => {
+    const m = computeFromInsight(d);
+    return {
+      date: d.date_start,
+      spend: m.spend,
+      conversions: m.conversions,
+      checkouts: m.checkouts,
+      revenue: m.revenue,
+      cpa: m.cpa,
+      roas: m.roas,
+    };
+  });
+}
+
 // Insights por campanha (uma linha por campanha)
 async function fetchCampaignInsights(env) {
   const fields =
-    "campaign_id,campaign_name,spend,impressions,clicks,ctr,cpc,cpm,frequency,actions,action_values";
+    "campaign_id,campaign_name,spend,impressions,clicks,ctr,cpc,cpm,frequency,actions,action_values,purchase_roas";
   const url =
     META_API + "/" + env.META_AD_ACCOUNT + "/insights" +
     "?level=campaign&date_preset=" + PERIODO +
@@ -197,7 +241,7 @@ async function fetchAds(env) {
   const fields =
     "name,effective_status," +
     "creative{image_url,thumbnail_url,body,title}," +
-    "insights.date_preset(" + PERIODO + "){spend,impressions,clicks,ctr,cpc,cpm,frequency,actions,action_values}";
+    "insights.date_preset(" + PERIODO + "){spend,impressions,clicks,ctr,cpc,cpm,frequency,actions,action_values,purchase_roas}";
   const filtering = JSON.stringify([
     { field: "effective_status", operator: "IN", value: ["ACTIVE"] },
   ]);
@@ -233,7 +277,13 @@ async function fetchAds(env) {
 function computeFromInsight(i) {
   const spend = num(i.spend);
   const conversions = pickAction(i.actions, CONV_TYPES);
+  const checkouts = pickAction(i.actions, IC_TYPES);
   const revenue = pickActionValue(i.action_values, VALUE_TYPES);
+  // ROAS: prioriza receita/gasto; se a receita não chegar (CAPI sem valor de
+  // compra), cai no purchase_roas que a própria Meta devolve, quando houver.
+  const metaRoas = i.purchase_roas && i.purchase_roas[0] ? Number(i.purchase_roas[0].value) || 0 : 0;
+  let roas = spend > 0 && revenue > 0 ? round2(revenue / spend) : null;
+  if (roas === null && metaRoas > 0) roas = round2(metaRoas);
   return {
     spend,
     impressions: num(i.impressions),
@@ -243,9 +293,10 @@ function computeFromInsight(i) {
     cpm: num(i.cpm),
     frequency: num(i.frequency),
     conversions,
+    checkouts,
     revenue: round2(revenue),
     cpa: conversions > 0 ? round2(spend / conversions) : null,
-    roas: spend > 0 && revenue > 0 ? round2(revenue / spend) : null,
+    roas,
   };
 }
 
@@ -269,6 +320,7 @@ async function analyzeWithGemini(env, account, campaigns, ads) {
         ctr_pct: account.ctr,
         cpm: account.cpm,
         frequencia: account.frequency,
+        checkouts: account.checkouts,
         conversoes: account.conversions,
         receita: account.revenue,
         cpa: account.cpa,
@@ -283,6 +335,7 @@ async function analyzeWithGemini(env, account, campaigns, ads) {
     ctr_pct: c.ctr,
     cpm: c.cpm,
     frequencia: c.frequency,
+    checkouts: c.checkouts,
     conversoes: c.conversions,
     receita: c.revenue,
     cpa: c.cpa,
@@ -300,6 +353,7 @@ async function analyzeWithGemini(env, account, campaigns, ads) {
     cpc: a.cpc,
     cpm: a.cpm,
     frequencia: a.frequency,
+    checkouts: a.checkouts,
     conversoes: a.conversions,
     cpa: a.cpa,
     roas: a.roas,
@@ -311,6 +365,8 @@ async function analyzeWithGemini(env, account, campaigns, ads) {
     "o criativo prevê o público, o targeting é sugestão. Analise a conta como um negócio, não só anúncios. " +
     "Diagnostique a saúde da conta, depois cada campanha relevante (eficiência de gasto, CPA, ROAS, fadiga " +
     "quando frequência > 2,5), e os criativos (o que no visual/título/copy explica o desempenho). " +
+    "Em conta low-ticket com poucas compras, use 'checkouts' (Initiate Checkout) como evento-ponte para ler intenção. " +
+    "Se houver compras mas receita/ROAS vierem zerados, sinalize explicitamente que o CAPI provavelmente não está enviando o valor da compra. " +
     "Por fim, gere uma lista CURTA de sugestões priorizadas e acionáveis para a conta — o que fazer primeiro.\n\n" +
     "Responda SOMENTE com JSON válido, sem markdown, neste formato:\n" +
     '{ "resumo": "visão geral do negócio em 2-3 frases", ' +
@@ -387,12 +443,13 @@ async function ensureSchema(env) {
       "created_at TEXT NOT NULL, " +
       "account_json TEXT, " +
       "campaigns_json TEXT, " +
+      "daily_json TEXT, " +
       "metrics_json TEXT NOT NULL, " +
       "analysis_json TEXT)"
   ).run();
 
   // Migração suave: adiciona colunas novas em bancos antigos (ignora se já existem)
-  for (const col of ["account_json", "campaigns_json"]) {
+  for (const col of ["account_json", "campaigns_json", "daily_json"]) {
     try {
       await env.DB.prepare("ALTER TABLE runs ADD COLUMN " + col + " TEXT").run();
     } catch (e) {
@@ -572,8 +629,8 @@ const HTML = `<!DOCTYPE html>
     return '<div class="metrics">'
       + metricCell("Gasto", fmt(a.spend, true))
       + metricCell("CTR %", fmt(a.ctr))
-      + metricCell("CPM", fmt(a.cpm, true))
       + metricCell("Freq.", fmt(a.frequency))
+      + metricCell("Checkouts", fmt(a.checkouts))
       + metricCell(a.conversions > 0 ? "CPA" : "Conv.", a.conversions > 0 ? fmt(a.cpa, true) : "0")
       + metricCell("ROAS", a.roas ? fmt(a.roas) + "x" : "—")
       + '</div>';
@@ -599,16 +656,19 @@ const HTML = `<!DOCTYPE html>
     html += '<div class="kpis">'
       + kpiCell("Gasto", fmt(acc.spend, true))
       + kpiCell("Conversões", fmt(acc.conversions))
+      + kpiCell("Checkouts", fmt(acc.checkouts))
       + kpiCell("CPA", acc.conversions > 0 ? fmt(acc.cpa, true) : "—")
       + kpiCell("ROAS", acc.roas ? fmt(acc.roas) + "x" : "—")
       + kpiCell("CTR %", fmt(acc.ctr))
       + kpiCell("CPM", fmt(acc.cpm, true))
       + '</div>';
 
-    var spendSeries = HISTORY.map(function(h){ return h.spend; });
+    var daily = DATA.daily || [];
+    var spendSeries = daily.length ? daily.map(function(d){ return d.spend; }) : HISTORY.map(function(h){ return h.spend; });
+    var trendLabel = daily.length ? ("Gasto diário · últimos " + daily.length + " dias") : "Gasto ao longo dos snapshots";
     var spark = sparkline(spendSeries);
     if (spark) {
-      html += '<div class="trend"><div class="sec">Gasto ao longo dos snapshots</div>' + spark + '</div>';
+      html += '<div class="trend"><div class="sec">' + trendLabel + '</div>' + spark + '</div>';
     }
 
     if (an.resumo || an.saude_conta || (an.sugestoes_prioritarias && an.sugestoes_prioritarias.length)) {
