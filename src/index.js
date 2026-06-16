@@ -1,7 +1,8 @@
 // ============================================================
-// CRIATIVO JUDGE — avaliador de criativos do Meta Ads
-// Cron: busca métricas + criativos -> Claude analisa -> salva no D1
-// Dashboard: ranking, campeão, pontos fortes e melhorias
+// META ADS ANALYST — painel de métricas do negócio no Meta Ads
+// Cron: coleta insights (conta + campanhas + anúncios) -> Gemini analisa
+//       -> salva snapshot no D1. Dashboard mostra visão geral,
+//       drill-down por campanha e o veredito dos criativos.
 // Secrets necessários (Settings > Variables do Worker):
 //   META_TOKEN        token de acesso (System User, ads_read)
 //   META_AD_ACCOUNT   id da conta no formato act_1234567890
@@ -10,8 +11,26 @@
 // ============================================================
 
 const META_API = "https://graph.facebook.com/v21.0";
-const PERIODO = "maximum"; // janela das métricas (desde que o anúncio foi criado)
+const PERIODO = "maximum"; // janela das métricas (date_preset da Meta)
 const MAX_IMAGENS = 6;     // máx. de imagens enviadas à IA por análise
+const MAX_CAMPANHAS = 15;  // máx. de campanhas mandadas à IA / mostradas
+
+// Tipos de ação que contam como conversão (compra ou lead)
+const CONV_TYPES = [
+  "purchase",
+  "omni_purchase",
+  "offsite_conversion.fb_pixel_purchase",
+  "onsite_web_purchase",
+  "lead",
+  "onsite_conversion.lead_grouped",
+];
+// Tipos de ação que carregam valor de receita (só compra)
+const VALUE_TYPES = [
+  "purchase",
+  "omni_purchase",
+  "offsite_conversion.fb_pixel_purchase",
+  "onsite_web_purchase",
+];
 
 export default {
   async scheduled(event, env, ctx) {
@@ -38,6 +57,8 @@ export default {
           if (!row) return json(null);
           return json({
             created_at: row.created_at,
+            account: safeParse(row.account_json),
+            campaigns: safeParse(row.campaigns_json) || [],
             ads: JSON.parse(row.metrics_json),
             analysis: safeParse(row.analysis_json),
           });
@@ -45,12 +66,18 @@ export default {
 
         if (url.pathname === "/api/history") {
           const rs = await env.DB
-            .prepare("SELECT created_at, metrics_json FROM runs ORDER BY id DESC LIMIT 14")
+            .prepare("SELECT created_at, account_json FROM runs ORDER BY id DESC LIMIT 30")
             .all();
-          const runs = (rs.results || []).reverse().map((r) => ({
-            created_at: r.created_at,
-            ads: JSON.parse(r.metrics_json).map((a) => ({ id: a.id, name: a.name, ctr: a.ctr, cpa: a.cpa })),
-          }));
+          const runs = (rs.results || []).reverse().map((r) => {
+            const acc = safeParse(r.account_json) || {};
+            return {
+              created_at: r.created_at,
+              spend: acc.spend ?? null,
+              cpa: acc.cpa ?? null,
+              roas: acc.roas ?? null,
+              conversions: acc.conversions ?? null,
+            };
+          });
           return json(runs);
         }
 
@@ -74,26 +101,89 @@ export default {
 async function runAnalysis(env) {
   await ensureSchema(env);
 
-  const ads = await fetchAds(env);
-  if (!ads.length) {
-    return { ok: false, error: "Nenhum anúncio ativo com métricas no período (" + PERIODO + ")." };
+  const [account, campaigns, ads] = await Promise.all([
+    fetchAccountInsights(env),
+    fetchCampaignInsights(env),
+    fetchAds(env),
+  ]);
+
+  if (!ads.length && !campaigns.length) {
+    return { ok: false, error: "Nenhum dado com métricas no período (" + PERIODO + ")." };
   }
 
   rankAds(ads);
+  campaigns.sort((a, b) => b.spend - a.spend);
 
   let analysis = null;
   try {
-    analysis = await analyzeWithGemini(env, ads);
+    analysis = await analyzeWithGemini(env, account, campaigns, ads);
   } catch (e) {
     analysis = { erro: "Falha na análise de IA: " + e.message };
   }
 
   await env.DB
-    .prepare("INSERT INTO runs (created_at, metrics_json, analysis_json) VALUES (?, ?, ?)")
-    .bind(new Date().toISOString(), JSON.stringify(ads), JSON.stringify(analysis))
+    .prepare(
+      "INSERT INTO runs (created_at, account_json, campaigns_json, metrics_json, analysis_json) VALUES (?, ?, ?, ?, ?)"
+    )
+    .bind(
+      new Date().toISOString(),
+      JSON.stringify(account),
+      JSON.stringify(campaigns),
+      JSON.stringify(ads),
+      JSON.stringify(analysis)
+    )
     .run();
 
-  return { ok: true, ads: ads.length, vencedor: ads[0]?.name || null };
+  return {
+    ok: true,
+    campanhas: campaigns.length,
+    anuncios: ads.length,
+    gasto: account?.spend ?? null,
+    vencedor: ads[0]?.name || null,
+  };
+}
+
+// Insights agregados da conta inteira no período
+async function fetchAccountInsights(env) {
+  const fields =
+    "spend,impressions,clicks,ctr,cpc,cpm,frequency,actions,action_values";
+  const url =
+    META_API + "/" + env.META_AD_ACCOUNT + "/insights" +
+    "?level=account&date_preset=" + PERIODO +
+    "&fields=" + encodeURIComponent(fields) +
+    "&access_token=" + env.META_TOKEN;
+
+  const res = await fetch(url);
+  const data = await res.json();
+  if (data.error) throw new Error("Meta API (conta): " + data.error.message);
+
+  const row = data.data && data.data[0];
+  if (!row) return null;
+  return Object.assign({ name: "Conta inteira" }, computeFromInsight(row));
+}
+
+// Insights por campanha (uma linha por campanha)
+async function fetchCampaignInsights(env) {
+  const fields =
+    "campaign_id,campaign_name,spend,impressions,clicks,ctr,cpc,cpm,frequency,actions,action_values";
+  const url =
+    META_API + "/" + env.META_AD_ACCOUNT + "/insights" +
+    "?level=campaign&date_preset=" + PERIODO +
+    "&fields=" + encodeURIComponent(fields) +
+    "&limit=200&access_token=" + env.META_TOKEN;
+
+  const res = await fetch(url);
+  const data = await res.json();
+  if (data.error) throw new Error("Meta API (campanhas): " + data.error.message);
+
+  return (data.data || [])
+    .filter((c) => num(c.spend) > 0)
+    .map((c) =>
+      Object.assign(
+        { id: c.campaign_id, name: c.campaign_name || "(sem nome)" },
+        computeFromInsight(c)
+      )
+    );
 }
 
 // Busca anúncios ativos com insights + criativo na Meta Marketing API
@@ -101,7 +191,7 @@ async function fetchAds(env) {
   const fields =
     "name,effective_status," +
     "creative{image_url,thumbnail_url,body,title}," +
-    "insights.date_preset(" + PERIODO + "){spend,impressions,clicks,ctr,cpc,cpm,frequency,actions}";
+    "insights.date_preset(" + PERIODO + "){spend,impressions,clicks,ctr,cpc,cpm,frequency,actions,action_values}";
   const filtering = JSON.stringify([
     { field: "effective_status", operator: "IN", value: ["ACTIVE"] },
   ]);
@@ -114,38 +204,43 @@ async function fetchAds(env) {
 
   const res = await fetch(url);
   const data = await res.json();
-  if (data.error) throw new Error("Meta API: " + data.error.message);
+  if (data.error) throw new Error("Meta API (anúncios): " + data.error.message);
 
   return (data.data || [])
     .filter((a) => a.insights && a.insights.data && a.insights.data[0])
     .map((a) => {
-      const i = a.insights.data[0];
-      const spend = num(i.spend);
-      const conversions = pickAction(i.actions, [
-        "purchase",
-        "omni_purchase",
-        "offsite_conversion.fb_pixel_purchase",
-        "onsite_web_purchase",
-        "lead",
-        "onsite_conversion.lead_grouped",
-      ]);
-      return {
-        id: a.id,
-        name: a.name,
-        image: (a.creative && (a.creative.image_url || a.creative.thumbnail_url)) || null,
-        title: (a.creative && a.creative.title) || "",
-        copy: (a.creative && a.creative.body) || "",
-        spend,
-        impressions: num(i.impressions),
-        clicks: num(i.clicks),
-        ctr: num(i.ctr),
-        cpc: num(i.cpc),
-        cpm: num(i.cpm),
-        frequency: num(i.frequency),
-        conversions,
-        cpa: conversions > 0 ? round2(spend / conversions) : null,
-      };
+      const m = computeFromInsight(a.insights.data[0]);
+      return Object.assign(
+        {
+          id: a.id,
+          name: a.name,
+          image: (a.creative && (a.creative.image_url || a.creative.thumbnail_url)) || null,
+          title: (a.creative && a.creative.title) || "",
+          copy: (a.creative && a.creative.body) || "",
+        },
+        m
+      );
     });
+}
+
+// Extrai o bloco de métricas comum a conta/campanha/anúncio
+function computeFromInsight(i) {
+  const spend = num(i.spend);
+  const conversions = pickAction(i.actions, CONV_TYPES);
+  const revenue = pickActionValue(i.action_values, VALUE_TYPES);
+  return {
+    spend,
+    impressions: num(i.impressions),
+    clicks: num(i.clicks),
+    ctr: num(i.ctr),
+    cpc: num(i.cpc),
+    cpm: num(i.cpm),
+    frequency: num(i.frequency),
+    conversions,
+    revenue: round2(revenue),
+    cpa: conversions > 0 ? round2(spend / conversions) : null,
+    roas: spend > 0 && revenue > 0 ? round2(revenue / spend) : null,
+  };
 }
 
 // Ranking determinístico: menor CPA primeiro; sem conversões, maior CTR
@@ -159,38 +254,75 @@ function rankAds(ads) {
   ads.forEach((a, idx) => (a.rank = idx + 1));
 }
 
-// Envia métricas + imagens dos criativos para o Gemini e pede JSON
-async function analyzeWithGemini(env, ads) {
-  const metricsTable = ads.map((a) => ({
+// Envia conta + campanhas + criativos ao Gemini e pede um relatório em JSON
+async function analyzeWithGemini(env, account, campaigns, ads) {
+  const contaResumo = account
+    ? {
+        gasto: account.spend,
+        impressoes: account.impressions,
+        ctr_pct: account.ctr,
+        cpm: account.cpm,
+        frequencia: account.frequency,
+        conversoes: account.conversions,
+        receita: account.revenue,
+        cpa: account.cpa,
+        roas: account.roas,
+      }
+    : null;
+
+  const campanhasTabela = campaigns.slice(0, MAX_CAMPANHAS).map((c) => ({
+    campaign_id: c.id,
+    nome: c.name,
+    gasto: c.spend,
+    ctr_pct: c.ctr,
+    cpm: c.cpm,
+    frequencia: c.frequency,
+    conversoes: c.conversions,
+    receita: c.revenue,
+    cpa: c.cpa,
+    roas: c.roas,
+  }));
+
+  const adsTabela = ads.map((a) => ({
     ad_id: a.id,
     nome: a.name,
     rank: a.rank,
     titulo: a.title,
     copy: a.copy ? a.copy.slice(0, 400) : "",
     gasto: a.spend,
-    impressoes: a.impressions,
     ctr_pct: a.ctr,
     cpc: a.cpc,
     cpm: a.cpm,
     frequencia: a.frequency,
     conversoes: a.conversions,
     cpa: a.cpa,
+    roas: a.roas,
   }));
 
-  const systemInstruction = 
-    "Você é um especialista em direct response e Meta Ads para produtos digitais low-ticket na LATAM. " +
-    "Analise o criativo vencedor (rank 1): o que na imagem, no título e na copy explica a performance? " +
-    "Depois diagnostique cada um dos demais e proponha melhorias concretas e acionáveis " +
-    "(ângulo, hook, elemento visual, prova, CTA). Considere fadiga quando a frequência for alta (>2,5).\n\n" +
+  const systemInstruction =
+    "Você é um analista sênior de mídia paga e direct response especializado em infoprodutos " +
+    "low-ticket na LATAM, com tráfego frio e mobile-first, sob a lógica do retrieval da Meta (Andromeda): " +
+    "o criativo prevê o público, o targeting é sugestão. Analise a conta como um negócio, não só anúncios. " +
+    "Diagnostique a saúde da conta, depois cada campanha relevante (eficiência de gasto, CPA, ROAS, fadiga " +
+    "quando frequência > 2,5), e os criativos (o que no visual/título/copy explica o desempenho). " +
+    "Por fim, gere uma lista CURTA de sugestões priorizadas e acionáveis para a conta — o que fazer primeiro.\n\n" +
     "Responda SOMENTE com JSON válido, sem markdown, neste formato:\n" +
-    '{ "resumo": "visão geral em 2-3 frases", ' +
+    '{ "resumo": "visão geral do negócio em 2-3 frases", ' +
+    '"saude_conta": "diagnóstico da conta como um todo", ' +
+    '"sugestoes_prioritarias": ["ação 1", "ação 2", "ação 3"], ' +
+    '"campanhas": [ { "campaign_id": "...", "diagnostico": "...", "melhorias": ["..."] } ], ' +
     '"vencedor": { "ad_id": "...", "pontos_fortes": ["..."], "melhorias": ["..."] }, ' +
     '"criativos": [ { "ad_id": "...", "diagnostico": "...", "melhorias": ["..."] } ] }';
 
   const parts = [
     {
-      text: "Abaixo estão as métricas dos últimos 7 dias dos anúncios ativos, já ranqueados (rank 1 = melhor, por menor CPA ou maior CTR). Em seguida, as imagens dos criativos na mesma ordem.\n\nMÉTRICAS:\n" + JSON.stringify(metricsTable, null, 2)
-    }
+      text:
+        "Dados da conta no período (" + PERIODO + "). Anúncios já ranqueados (rank 1 = melhor, por menor CPA " +
+        "ou maior CTR). As imagens dos criativos vêm logo abaixo, na ordem do ranking.\n\n" +
+        "CONTA:\n" + JSON.stringify(contaResumo, null, 2) +
+        "\n\nCAMPANHAS:\n" + JSON.stringify(campanhasTabela, null, 2) +
+        "\n\nANÚNCIOS:\n" + JSON.stringify(adsTabela, null, 2),
+    },
   ];
 
   for (const a of ads.slice(0, MAX_IMAGENS)) {
@@ -198,8 +330,8 @@ async function analyzeWithGemini(env, ads) {
     try {
       const imgRes = await fetch(a.image);
       const arrBuf = await imgRes.arrayBuffer();
-      
-      let binary = '';
+
+      let binary = "";
       const bytes = new Uint8Array(arrBuf);
       const len = bytes.byteLength;
       for (let i = 0; i < len; i++) {
@@ -208,30 +340,24 @@ async function analyzeWithGemini(env, ads) {
       const base64 = btoa(binary);
 
       parts.push({ text: "Imagem do criativo rank " + a.rank + " — " + a.name + " (ad_id " + a.id + "):" });
-      parts.push({
-        inline_data: {
-          mime_type: "image/jpeg",
-          data: base64
-        }
-      });
+      parts.push({ inline_data: { mime_type: "image/jpeg", data: base64 } });
     } catch (e) {
       console.error("Erro ao baixar imagem do ad " + a.id + ": ", e);
     }
   }
 
-  const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent?key=${env.GEMINI_API_KEY}`, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-    },
-    body: JSON.stringify({
-      contents: [{ parts }],
-      system_instruction: { parts: [{ text: systemInstruction }] },
-      generationConfig: {
-        responseMimeType: "application/json"
-      }
-    }),
-  });
+  const res = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent?key=${env.GEMINI_API_KEY}`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        contents: [{ parts }],
+        system_instruction: { parts: [{ text: systemInstruction }] },
+        generationConfig: { responseMimeType: "application/json" },
+      }),
+    }
+  );
 
   const data = await res.json();
   if (data.error) throw new Error("Gemini API: " + data.error.message);
@@ -253,15 +379,35 @@ async function ensureSchema(env) {
     "CREATE TABLE IF NOT EXISTS runs (" +
       "id INTEGER PRIMARY KEY AUTOINCREMENT, " +
       "created_at TEXT NOT NULL, " +
+      "account_json TEXT, " +
+      "campaigns_json TEXT, " +
       "metrics_json TEXT NOT NULL, " +
       "analysis_json TEXT)"
   ).run();
+
+  // Migração suave: adiciona colunas novas em bancos antigos (ignora se já existem)
+  for (const col of ["account_json", "campaigns_json"]) {
+    try {
+      await env.DB.prepare("ALTER TABLE runs ADD COLUMN " + col + " TEXT").run();
+    } catch (e) {
+      /* coluna já existe */
+    }
+  }
 }
 
 function pickAction(actions, types) {
   if (!actions) return 0;
   for (const t of types) {
     const f = actions.find((x) => x.action_type === t);
+    if (f) return Number(f.value) || 0;
+  }
+  return 0;
+}
+
+function pickActionValue(values, types) {
+  if (!values) return 0;
+  for (const t of types) {
+    const f = values.find((x) => x.action_type === t);
     if (f) return Number(f.value) || 0;
   }
   return 0;
@@ -284,7 +430,7 @@ const HTML = `<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Criativo Judge</title>
+<title>Meta Ads Analyst</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;600&family=Archivo+Black&family=Spline+Sans+Mono:wght@400;600&display=swap" rel="stylesheet">
 <style>
@@ -294,12 +440,15 @@ const HTML = `<!DOCTYPE html>
   }
   *{box-sizing:border-box;margin:0;padding:0}
   body{background:var(--bg);color:var(--ink);font-family:'Archivo',sans-serif;font-size:15px;line-height:1.5;padding:16px;max-width:760px;margin:0 auto}
-  h1{font-family:'Archivo Black',sans-serif;font-size:26px;letter-spacing:-0.5px;text-transform:uppercase}
+  h1{font-family:'Archivo Black',sans-serif;font-size:24px;letter-spacing:-0.5px;text-transform:uppercase}
   header{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:6px}
-  .sub{color:var(--muted);font-size:13px;margin-bottom:18px}
+  .sub{color:var(--muted);font-size:13px;margin-bottom:14px}
   button{font-family:'Archivo',sans-serif;font-weight:600;font-size:14px;border:1.5px solid var(--ink);background:var(--ink);color:#fff;border-radius:8px;padding:10px 14px;cursor:pointer}
   button:disabled{opacity:.5}
   button:focus-visible{outline:3px solid var(--blue);outline-offset:2px}
+  .tabs{display:flex;gap:6px;margin-bottom:16px;border-bottom:1.5px solid var(--line)}
+  .tab{background:none;border:none;color:var(--muted);font-weight:600;font-size:14px;padding:10px 4px;margin-right:14px;cursor:pointer;border-bottom:3px solid transparent;border-radius:0}
+  .tab.active{color:var(--ink);border-bottom-color:var(--ink)}
   .card{background:var(--card);border:1.5px solid var(--line);border-radius:14px;padding:16px;margin-bottom:14px;position:relative}
   .champ{border:2px solid var(--ink);box-shadow:5px 5px 0 var(--ink)}
   .stamp{position:absolute;top:-12px;right:12px;transform:rotate(-6deg);font-family:'Archivo Black',sans-serif;font-size:13px;letter-spacing:1.5px;color:var(--gold);border:2.5px solid var(--gold);border-radius:6px;padding:3px 10px;background:var(--card);text-transform:uppercase}
@@ -310,34 +459,48 @@ const HTML = `<!DOCTYPE html>
   .m{background:var(--bg);border-radius:8px;padding:8px}
   .m .v{font-family:'Spline Sans Mono',monospace;font-weight:600;font-size:15px}
   .m .l{font-size:10px;text-transform:uppercase;letter-spacing:.8px;color:var(--muted)}
+  .kpis{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:16px}
+  .kpi{background:var(--card);border:1.5px solid var(--line);border-radius:12px;padding:12px}
+  .kpi .v{font-family:'Spline Sans Mono',monospace;font-weight:600;font-size:20px}
+  .kpi .l{font-size:10px;text-transform:uppercase;letter-spacing:.8px;color:var(--muted);margin-top:2px}
   .sec{font-family:'Archivo Black',sans-serif;font-size:12px;text-transform:uppercase;letter-spacing:1.2px;margin:12px 0 6px}
   .sec.gold{color:var(--gold)} .sec.blue{color:var(--blue)}
   ul{padding-left:18px}
   li{margin-bottom:5px}
   .diag{color:var(--ink)}
-  .resumo{background:var(--ink);color:#F4F4F2;border-radius:14px;padding:16px;margin-bottom:18px;font-size:14px}
+  .resumo{background:var(--ink);color:#F4F4F2;border-radius:14px;padding:16px;margin-bottom:14px;font-size:14px}
   .resumo .sec{color:#FBBF24;margin-top:0}
+  .resumo .sec.next{color:#7DD3FC;margin-top:14px}
+  .trend{background:var(--card);border:1.5px solid var(--line);border-radius:12px;padding:14px;margin-bottom:16px}
+  .trend svg{display:block;width:100%;height:48px;margin-top:8px}
+  .trend polyline{fill:none;stroke:var(--blue);stroke-width:2}
   .empty{text-align:center;color:var(--muted);padding:50px 20px}
   .err{color:var(--bad);font-weight:600}
   #keybox{display:flex;gap:8px;margin:30px 0}
   #keybox input{flex:1;border:1.5px solid var(--line);border-radius:8px;padding:10px;font-size:15px;font-family:'Spline Sans Mono',monospace}
   .ts{font-size:12px;color:var(--muted)}
   @media (prefers-reduced-motion: no-preference){
-    .card{animation:up .3s ease both}
+    .card,.kpi{animation:up .3s ease both}
     @keyframes up{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
   }
 </style>
 </head>
 <body>
 <header>
-  <h1>Criativo Judge</h1>
+  <h1>Meta Ads Analyst</h1>
   <button id="runbtn" style="display:none">Rodar análise</button>
 </header>
-<p class="sub">Veredito dos seus criativos no Meta Ads · últimos 7 dias <span class="ts" id="ts"></span></p>
+<p class="sub">Painel da sua conta no Meta Ads · período: histórico <span class="ts" id="ts"></span></p>
 
 <div id="keybox">
   <input id="keyinput" type="password" placeholder="Chave de acesso (DASH_KEY)">
   <button id="keybtn">Entrar</button>
+</div>
+
+<div id="tabs" class="tabs" style="display:none">
+  <button class="tab active" data-tab="overview">Visão geral</button>
+  <button class="tab" data-tab="campaigns">Campanhas</button>
+  <button class="tab" data-tab="creatives">Criativos</button>
 </div>
 
 <div id="app"></div>
@@ -345,8 +508,11 @@ const HTML = `<!DOCTYPE html>
 <script>
 (function(){
   var KEY = localStorage.getItem("dashkey") || "";
+  var TAB = "overview";
+  var DATA = null, HISTORY = [];
   var app = document.getElementById("app");
   var keybox = document.getElementById("keybox");
+  var tabs = document.getElementById("tabs");
   var runbtn = document.getElementById("runbtn");
 
   document.getElementById("keybtn").onclick = function(){
@@ -358,13 +524,21 @@ const HTML = `<!DOCTYPE html>
     runbtn.disabled = true; runbtn.textContent = "Analisando...";
     fetch("/api/run?key=" + encodeURIComponent(KEY), { method: "POST" })
       .then(function(r){ return r.json(); })
-      .then(function(res){ 
+      .then(function(res){
         if (res.error) alert(res.error);
-        runbtn.disabled = false; runbtn.textContent = "Rodar análise"; 
-        load(); 
+        runbtn.disabled = false; runbtn.textContent = "Rodar análise";
+        load();
       })
       .catch(function(){ runbtn.disabled = false; runbtn.textContent = "Rodar análise"; });
   };
+  Array.prototype.forEach.call(tabs.querySelectorAll(".tab"), function(t){
+    t.onclick = function(){
+      TAB = t.getAttribute("data-tab");
+      Array.prototype.forEach.call(tabs.querySelectorAll(".tab"), function(x){ x.classList.remove("active"); });
+      t.classList.add("active");
+      render();
+    };
+  });
 
   function fmt(v, money){
     if (v === null || v === undefined) return "—";
@@ -379,45 +553,121 @@ const HTML = `<!DOCTYPE html>
   function metricCell(label, value){
     return '<div class="m"><div class="v">' + value + '</div><div class="l">' + label + '</div></div>';
   }
+  function kpiCell(label, value){
+    return '<div class="kpi"><div class="v">' + value + '</div><div class="l">' + label + '</div></div>';
+  }
   function listHtml(items){
     if (!items || !items.length) return "";
     var out = "<ul>";
     for (var i = 0; i < items.length; i++) out += "<li>" + esc(items[i]) + "</li>";
     return out + "</ul>";
   }
+  function metricsGrid(a){
+    return '<div class="metrics">'
+      + metricCell("Gasto", fmt(a.spend, true))
+      + metricCell("CTR %", fmt(a.ctr))
+      + metricCell("CPM", fmt(a.cpm, true))
+      + metricCell("Freq.", fmt(a.frequency))
+      + metricCell(a.conversions > 0 ? "CPA" : "Conv.", a.conversions > 0 ? fmt(a.cpa, true) : "0")
+      + metricCell("ROAS", a.roas ? fmt(a.roas) + "x" : "—")
+      + '</div>';
+  }
+  function sparkline(values){
+    var clean = values.filter(function(v){ return v !== null && v !== undefined; });
+    if (clean.length < 2) return "";
+    var max = Math.max.apply(null, clean), min = Math.min.apply(null, clean);
+    var range = (max - min) || 1, W = 320, H = 48;
+    var pts = clean.map(function(v, i){
+      var x = (i / (clean.length - 1)) * W;
+      var y = H - ((v - min) / range) * H;
+      return x.toFixed(1) + "," + y.toFixed(1);
+    }).join(" ");
+    return '<svg viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="none"><polyline points="' + pts + '"/></svg>';
+  }
 
-  function render(data){
-    if (!data) {
-      app.innerHTML = '<div class="empty">Nenhuma análise ainda. Toque em <b>Rodar análise</b> para gerar a primeira.</div>';
+  function renderOverview(){
+    var acc = DATA.account || {};
+    var an = DATA.analysis || {};
+    var html = "";
+
+    html += '<div class="kpis">'
+      + kpiCell("Gasto", fmt(acc.spend, true))
+      + kpiCell("Conversões", fmt(acc.conversions))
+      + kpiCell("CPA", acc.conversions > 0 ? fmt(acc.cpa, true) : "—")
+      + kpiCell("ROAS", acc.roas ? fmt(acc.roas) + "x" : "—")
+      + kpiCell("CTR %", fmt(acc.ctr))
+      + kpiCell("CPM", fmt(acc.cpm, true))
+      + '</div>';
+
+    var spendSeries = HISTORY.map(function(h){ return h.spend; });
+    var spark = sparkline(spendSeries);
+    if (spark) {
+      html += '<div class="trend"><div class="sec">Gasto ao longo dos snapshots</div>' + spark + '</div>';
+    }
+
+    if (an.resumo || an.saude_conta || (an.sugestoes_prioritarias && an.sugestoes_prioritarias.length)) {
+      html += '<div class="resumo">';
+      if (an.resumo) html += '<div class="sec">Resumo do negócio</div>' + esc(an.resumo);
+      if (an.saude_conta) html += '<div class="sec next">Saúde da conta</div>' + esc(an.saude_conta);
+      if (an.sugestoes_prioritarias && an.sugestoes_prioritarias.length) {
+        html += '<div class="sec next">O que fazer primeiro</div>' + listHtml(an.sugestoes_prioritarias);
+      }
+      html += '</div>';
+    }
+    if (an.erro) html += '<div class="resumo"><span class="err">' + esc(an.erro) + '</span></div>';
+
+    if (!html) html = '<div class="empty">Sem dados ainda. Toque em <b>Rodar análise</b>.</div>';
+    app.innerHTML = html;
+  }
+
+  function renderCampaigns(){
+    var an = DATA.analysis || {};
+    var byId = {};
+    var diag = an.campanhas || [];
+    for (var i = 0; i < diag.length; i++) byId[diag[i].campaign_id] = diag[i];
+
+    var camps = DATA.campaigns || [];
+    if (!camps.length) {
+      app.innerHTML = '<div class="empty">Nenhuma campanha com gasto no período.</div>';
       return;
     }
-    document.getElementById("ts").textContent = "· atualizado " + new Date(data.created_at).toLocaleString("pt-BR");
-    var an = data.analysis || {};
+    var html = "";
+    for (var j = 0; j < camps.length; j++) {
+      var c = camps[j];
+      html += '<div class="card">';
+      html += '<div class="adname">' + esc(c.name) + '</div>';
+      html += '<div class="rank">Campanha · receita ' + fmt(c.revenue, true) + '</div>';
+      html += metricsGrid(c);
+      if (byId[c.id]) {
+        html += '<div class="sec">Diagnóstico</div><p class="diag">' + esc(byId[c.id].diagnostico) + '</p>';
+        html += '<div class="sec blue">Melhorias propostas</div>' + listHtml(byId[c.id].melhorias);
+      }
+      html += '</div>';
+    }
+    app.innerHTML = html;
+  }
+
+  function renderCreatives(){
+    var an = DATA.analysis || {};
     var byId = {};
     var crts = an.criativos || [];
     for (var i = 0; i < crts.length; i++) byId[crts[i].ad_id] = crts[i];
 
+    var ads = DATA.ads || [];
+    if (!ads.length) {
+      app.innerHTML = '<div class="empty">Nenhum anúncio ativo com métricas.</div>';
+      return;
+    }
     var html = "";
-    if (an.resumo) html += '<div class="resumo"><div class="sec">Resumo do juiz</div>' + esc(an.resumo) + '</div>';
-    if (an.erro) html += '<div class="resumo"><span class="err">' + esc(an.erro) + '</span></div>';
-
-    for (var j = 0; j < data.ads.length; j++) {
-      var a = data.ads[j];
+    for (var j = 0; j < ads.length; j++) {
+      var a = ads[j];
       var isChamp = a.rank === 1;
       html += '<div class="card' + (isChamp ? " champ" : "") + '">';
       if (isChamp) html += '<div class="stamp">Campeão</div>';
       html += '<div class="adname">' + esc(a.name) + '</div>';
-      html += '<div class="rank">Rank ' + a.rank + " de " + data.ads.length + '</div>';
+      html += '<div class="rank">Rank ' + a.rank + " de " + ads.length + '</div>';
       if (a.image) html += '<img class="creative" src="' + esc(a.image) + '" alt="Criativo ' + esc(a.name) + '">';
-      html += '<div class="metrics">'
-        + metricCell("Gasto", fmt(a.spend, true))
-        + metricCell("CTR %", fmt(a.ctr))
-        + metricCell("CPC", fmt(a.cpc, true))
-        + metricCell("CPM", fmt(a.cpm, true))
-        + metricCell("Freq.", fmt(a.frequency))
-        + metricCell(a.conversions > 0 ? "CPA" : "Conv.", a.conversions > 0 ? fmt(a.cpa, true) : "0")
-        + '</div>';
-
+      html += metricsGrid(a);
       if (isChamp && an.vencedor) {
         html += '<div class="sec gold">Pontos fortes</div>' + listHtml(an.vencedor.pontos_fortes);
         html += '<div class="sec blue">Para melhorar ainda mais</div>' + listHtml(an.vencedor.melhorias);
@@ -430,19 +680,33 @@ const HTML = `<!DOCTYPE html>
     app.innerHTML = html;
   }
 
+  function render(){
+    if (!DATA) {
+      app.innerHTML = '<div class="empty">Nenhuma análise ainda. Toque em <b>Rodar análise</b> para gerar a primeira.</div>';
+      return;
+    }
+    document.getElementById("ts").textContent = "· atualizado " + new Date(DATA.created_at).toLocaleString("pt-BR");
+    if (TAB === "campaigns") renderCampaigns();
+    else if (TAB === "creatives") renderCreatives();
+    else renderOverview();
+  }
+
   function load(){
     if (!KEY) return;
-    fetch("/api/latest?key=" + encodeURIComponent(KEY))
-      .then(function(r){
-        if (r.status === 401) { localStorage.removeItem("dashkey"); KEY = ""; keybox.style.display = "flex"; runbtn.style.display = "none"; throw new Error("auth"); }
+    Promise.all([
+      fetch("/api/latest?key=" + encodeURIComponent(KEY)).then(function(r){
+        if (r.status === 401) { localStorage.removeItem("dashkey"); KEY = ""; keybox.style.display = "flex"; tabs.style.display = "none"; runbtn.style.display = "none"; throw new Error("auth"); }
         return r.json();
-      })
-      .then(function(data){
-        keybox.style.display = "none";
-        runbtn.style.display = "inline-block";
-        render(data);
-      })
-      .catch(function(){});
+      }),
+      fetch("/api/history?key=" + encodeURIComponent(KEY)).then(function(r){ return r.json(); }).catch(function(){ return []; }),
+    ]).then(function(arr){
+      DATA = arr[0];
+      HISTORY = arr[1] || [];
+      keybox.style.display = "none";
+      tabs.style.display = DATA ? "flex" : "none";
+      runbtn.style.display = "inline-block";
+      render();
+    }).catch(function(){});
   }
 
   if (KEY) { keybox.style.display = "none"; load(); }
