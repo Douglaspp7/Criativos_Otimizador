@@ -18,7 +18,7 @@ const MAX_CAMPANHAS = 15;  // máx. de campanhas mandadas à IA / mostradas
 // Senha do dashboard. Troque o valor abaixo pela sua senha — é só isso.
 // (Se você preferir, pode definir um secret DASH_KEY no Cloudflare; quando
 //  ele existe, tem prioridade sobre esta. Mas não é obrigatório.)
-const DASH_KEY = "troque-esta-senha";
+const DASH_KEY = "Duda1982**";
 
 // Tipos de ação que contam como conversão (compra ou lead)
 const CONV_TYPES = [
