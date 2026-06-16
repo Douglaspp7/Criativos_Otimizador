@@ -44,6 +44,8 @@ const IC_TYPES = [
   "onsite_web_initiate_checkout",
 ];
 const DIAS_TENDENCIA = 30; // dias na série de tendência diária (time_increment=1)
+// Modelos do Gemini em ordem de preferência; cai para o próximo se um sumir
+const GEMINI_MODELS = ["gemini-2.5-pro", "gemini-2.5-flash"];
 
 export default {
   async scheduled(event, env, ctx) {
@@ -408,30 +410,37 @@ async function analyzeWithGemini(env, account, campaigns, ads) {
     }
   }
 
-  const res = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent?key=${env.GEMINI_API_KEY}`,
-    {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        contents: [{ parts }],
-        system_instruction: { parts: [{ text: systemInstruction }] },
-        generationConfig: { responseMimeType: "application/json" },
-      }),
+  const body = JSON.stringify({
+    contents: [{ parts }],
+    system_instruction: { parts: [{ text: systemInstruction }] },
+    generationConfig: { responseMimeType: "application/json" },
+  });
+
+  let lastErr = "";
+  for (const model of GEMINI_MODELS) {
+    const res = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${env.GEMINI_API_KEY}`,
+      { method: "POST", headers: { "content-type": "application/json" }, body }
+    );
+    const data = await res.json();
+
+    if (data.error) {
+      lastErr = data.error.message;
+      // Modelo indisponível/renomeado → tenta o próximo da lista
+      if (/not found|not supported|does not exist/i.test(lastErr)) continue;
+      throw new Error("Gemini API: " + lastErr);
     }
-  );
 
-  const data = await res.json();
-  if (data.error) throw new Error("Gemini API: " + data.error.message);
-
-  const text = data.candidates?.[0]?.content?.parts?.[0]?.text || "{}";
-  const clean = text.replace(/```json|```/g, "").trim();
-
-  try {
-    return JSON.parse(clean);
-  } catch {
-    return { resumo: clean }; // fallback: guarda o texto bruto
+    const text = data.candidates?.[0]?.content?.parts?.[0]?.text || "{}";
+    const clean = text.replace(/```json|```/g, "").trim();
+    try {
+      return JSON.parse(clean);
+    } catch {
+      return { resumo: clean }; // fallback: guarda o texto bruto
+    }
   }
+
+  throw new Error("Gemini API: nenhum modelo disponível (" + lastErr + ")");
 }
 
 // ---------------- Utilitários ----------------
@@ -534,6 +543,7 @@ const HTML = `<!DOCTYPE html>
   .resumo{background:var(--ink);color:#F4F4F2;border-radius:14px;padding:16px;margin-bottom:14px;font-size:14px}
   .resumo .sec{color:#FBBF24;margin-top:0}
   .resumo .sec.next{color:#7DD3FC;margin-top:14px}
+  .alert{background:#FEF3C7;border:1.5px solid var(--gold);color:#7A4F01;border-radius:12px;padding:12px 14px;margin-bottom:16px;font-size:14px;font-weight:600}
   .trend{background:var(--card);border:1.5px solid var(--line);border-radius:12px;padding:14px;margin-bottom:16px}
   .trend svg{display:block;width:100%;height:48px;margin-top:8px}
   .trend polyline{fill:none;stroke:var(--blue);stroke-width:2}
@@ -663,12 +673,20 @@ const HTML = `<!DOCTYPE html>
       + kpiCell("CPM", fmt(acc.cpm, true))
       + '</div>';
 
+    if (acc.conversions > 0 && !acc.revenue) {
+      html += '<div class="alert">⚠ ' + fmt(acc.conversions) + ' conversões e R$ 0 de receita — o CAPI provavelmente não está enviando o valor da compra. Sem isso, o ROAS fica cego.</div>';
+    }
+
     var daily = DATA.daily || [];
     var spendSeries = daily.length ? daily.map(function(d){ return d.spend; }) : HISTORY.map(function(h){ return h.spend; });
     var trendLabel = daily.length ? ("Gasto diário · últimos " + daily.length + " dias") : "Gasto ao longo dos snapshots";
     var spark = sparkline(spendSeries);
     if (spark) {
       html += '<div class="trend"><div class="sec">' + trendLabel + '</div>' + spark + '</div>';
+    }
+    if (daily.length) {
+      var cpaSpark = sparkline(daily.map(function(d){ return d.cpa; }));
+      if (cpaSpark) html += '<div class="trend"><div class="sec">CPA diário · últimos ' + daily.length + ' dias</div>' + cpaSpark + '</div>';
     }
 
     if (an.resumo || an.saude_conta || (an.sugestoes_prioritarias && an.sugestoes_prioritarias.length)) {
