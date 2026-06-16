@@ -34,10 +34,11 @@ No Worker criado: **Settings > Variables and Secrets**, adicione como *Secret*:
 | `META_TOKEN` | Token do System User com permissão `ads_read` |
 | `META_AD_ACCOUNT` | ID da conta no formato `act_1234567890` |
 | `GEMINI_API_KEY` | Sua chave da API do Gemini |
-| `DASH_KEY` | Uma senha que você inventa para abrir o dashboard |
+
+> A **senha do dashboard** fica direto no código: edite a constante `DASH_KEY` no topo de `src/index.js` (pelo GitHub mesmo) e troque `"troque-esta-senha"` pela sua. Não precisa configurar nada no Cloudflare. Se ainda assim quiser, dá pra definir um secret `DASH_KEY` no Worker — quando existe, ele tem prioridade.
 
 ### 5. Pronto
-Abra a URL do Worker, digite sua `DASH_KEY` e toque em **Rodar análise** para gerar o primeiro relatório. Depois disso, o cron roda sozinho às 6h e 18h (UTC).
+Abra a URL do Worker, digite a senha que você definiu na constante `DASH_KEY` e toque em **Rodar análise** para gerar o primeiro relatório. Depois disso, o cron roda sozinho às 6h e 18h (UTC).
 
 ## Como funciona
 
