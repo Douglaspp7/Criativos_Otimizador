@@ -56,6 +56,11 @@ const BUDGET_STEP_MAX = 30;     // % máximo de ajuste de verba por vez (trava d
 const BUDGET_PISO_CENTS = 500;  // verba diária mínima após reduzir (em centavos = R$5,00)
 const ACOES_VALIDAS = ["pausar", "escalar", "reduzir"]; // whitelist de tipos
 
+// ---- Notificação por WhatsApp (avisa quando há ação nova pra aprovar) ----
+// Usa o CallMeBot (grátis p/ uso pessoal). Número em formato internacional,
+// só dígitos (sem +, espaço ou traço). A apikey vem do secret CALLMEBOT_APIKEY.
+const WHATSAPP_PHONE = "5513988751089";
+
 export default {
   async scheduled(event, env, ctx) {
     ctx.waitUntil(runAnalysis(env).catch((e) => console.error("Cron:", e.message)));
@@ -214,11 +219,20 @@ async function runAnalysis(env) {
   const runId = ins?.meta?.last_row_id || null;
 
   // Fase 1: transforma as ações sugeridas pela IA em itens PENDENTES na fila.
-  let novasAcoes = 0;
+  let enfileiradas = [];
   try {
-    novasAcoes = await enqueueActions(env, runId, analysis, campaigns, ads);
+    enfileiradas = await enqueueActions(env, runId, analysis, campaigns, ads);
   } catch (e) {
     console.error("Fila de ações:", e.message);
+  }
+
+  // Avisa no WhatsApp quando há ação nova esperando aprovação.
+  if (enfileiradas.length) {
+    try {
+      await notifyWhatsApp(env, montarAvisoAcoes(env, enfileiradas));
+    } catch (e) {
+      console.error("WhatsApp:", e.message);
+    }
   }
 
   return {
@@ -227,7 +241,7 @@ async function runAnalysis(env) {
     anuncios: ads.length,
     gasto: account?.spend ?? null,
     vencedor: ads[0]?.name || null,
-    acoes_pendentes: novasAcoes,
+    acoes_pendentes: enfileiradas.length,
   };
 }
 
@@ -235,7 +249,7 @@ async function runAnalysis(env) {
 // PENDENTES (nada é executado aqui — você aprova depois pelo dashboard).
 async function enqueueActions(env, runId, analysis, campaigns, ads) {
   const acoes = (analysis && Array.isArray(analysis.acoes)) ? analysis.acoes : [];
-  if (!acoes.length) return 0;
+  if (!acoes.length) return [];
 
   const adById = {};
   for (const a of ads) adById[String(a.id)] = a;
@@ -251,7 +265,7 @@ async function enqueueActions(env, runId, analysis, campaigns, ads) {
   );
 
   const now = new Date().toISOString();
-  let count = 0;
+  const enfileiradas = [];
 
   for (const raw of acoes.slice(0, MAX_ACOES)) {
     const tipo = String(raw.tipo || "").toLowerCase();
@@ -301,10 +315,14 @@ async function enqueueActions(env, runId, analysis, campaigns, ads) {
       .run();
 
     jaPendente.add(targetId + "|" + tipo);
-    count++;
+    enfileiradas.push({
+      action_type: tipo,
+      target_name: raw.target_nome || ref.name || "(sem nome)",
+      percent,
+    });
   }
 
-  return count;
+  return enfileiradas;
 }
 
 // Insights agregados da conta inteira no período
@@ -680,6 +698,44 @@ async function metaWrite(token, id, params) {
   const data = await res.json();
   if (data.error) throw new Error("Meta API (escrita): " + data.error.message);
   return data;
+}
+
+// ---------------- Notificação (WhatsApp via CallMeBot) ----------------
+
+// Monta a mensagem listando as ações novas + link do painel (se houver DASH_URL).
+function montarAvisoAcoes(env, lista) {
+  const linhas = lista.map((a) => {
+    const verba =
+      (a.action_type === "escalar" || a.action_type === "reduzir") && a.percent
+        ? " " + (a.action_type === "escalar" ? "+" : "-") + a.percent + "%"
+        : "";
+    return "• " + a.action_type + verba + ": " + a.target_name;
+  });
+  const link = String(env.DASH_URL || "").trim();
+  return (
+    "🔔 Meta Ads Analyst\n" +
+    lista.length + " nova(s) ação(ões) aguardando sua aprovação:\n" +
+    linhas.join("\n") +
+    (link ? "\n\nAprovar: " + link : "\n\nAbra o painel para aprovar.")
+  );
+}
+
+// Envia a mensagem pelo CallMeBot. Sem apikey/telefone, não faz nada (silencioso).
+async function notifyWhatsApp(env, text) {
+  const apikey = String(env.CALLMEBOT_APIKEY || "").trim();
+  const phone = String(env.WHATSAPP_PHONE || WHATSAPP_PHONE || "").trim().replace(/\D/g, "");
+  if (!apikey || !phone) return;
+
+  const url =
+    "https://api.callmebot.com/whatsapp.php?phone=" + encodeURIComponent(phone) +
+    "&text=" + encodeURIComponent(text) +
+    "&apikey=" + encodeURIComponent(apikey);
+
+  const res = await fetch(url);
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    console.error("CallMeBot " + res.status + ": " + body.slice(0, 200));
+  }
 }
 
 // ---------------- Utilitários ----------------

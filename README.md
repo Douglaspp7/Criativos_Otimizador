@@ -19,6 +19,17 @@ A análise gera, junto do relatório, uma lista de **ações executáveis** com 
 
 Nada é executado sozinho: as ações ficam **pendentes** até você aprovar pelo dashboard. Por isso, para escrever na Meta (pausar, mexer em verba), o `META_TOKEN` precisa de permissão **`ads_management`** (a leitura usa `ads_read`). Toda decisão fica registrada no banco (`actions`).
 
+### Aviso no WhatsApp quando há ação nova
+
+Quando a análise gera ações novas, o Worker te manda um WhatsApp listando-as. Usa o **CallMeBot** (grátis para uso pessoal). Setup único:
+
+1. Salve o número **+34 644 51 95 23** nos seus contatos (ex.: "CallMeBot").
+2. Mande pra ele, pelo WhatsApp, a mensagem: `I allow callmebot to send me messages`.
+3. Ele responde com sua **apikey**.
+4. No Worker, em **Settings > Variables and Secrets**, adicione o secret `CALLMEBOT_APIKEY` com essa apikey.
+
+Seu número (`+55 13 98875-1089`) já está fixo na constante `WHATSAPP_PHONE` no topo de `src/index.js` — para trocar, edite lá ou defina o secret `WHATSAPP_PHONE` (só dígitos, ex.: `5513988751089`). Opcional: defina o secret `DASH_URL` com a URL do painel para o aviso já vir com o link de aprovação. Sem a `CALLMEBOT_APIKEY`, o aviso é simplesmente ignorado e o resto continua funcionando.
+
 ## Stack
 
 - **Cloudflare Worker** com Cron Trigger (análise automática 2x/dia)
@@ -45,6 +56,8 @@ No Worker criado: **Settings > Variables and Secrets**, adicione como *Secret*:
 | `META_TOKEN` | Token do System User. `ads_read` basta para avaliar; para **aprovar/executar ações** (pausar, mexer em verba) use `ads_management` |
 | `META_AD_ACCOUNT` | ID da conta no formato `act_1234567890` |
 | `GEMINI_API_KEY` | Sua chave da API do Gemini |
+| `CALLMEBOT_APIKEY` | *(opcional)* apikey do CallMeBot para receber o aviso no WhatsApp — veja a seção acima |
+| `DASH_URL` | *(opcional)* URL do painel, para o aviso de WhatsApp vir com o link de aprovação |
 
 > A **senha do dashboard** fica direto no código: edite a constante `DASH_KEY` no topo de `src/index.js` (pelo GitHub mesmo) e troque `"troque-esta-senha"` pela sua. Não precisa configurar nada no Cloudflare. Se ainda assim quiser, dá pra definir um secret `DASH_KEY` no Worker — quando existe, ele tem prioridade.
 
