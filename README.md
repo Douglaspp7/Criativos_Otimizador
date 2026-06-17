@@ -7,7 +7,19 @@ Painel de métricas do seu negócio no Meta Ads. A cada 12 horas o Worker coleta
 - **Visão geral** — KPIs da conta (gasto, conversões, CPA, ROAS, CTR, CPM), tendência de gasto ao longo dos snapshots e o resumo + sugestões da IA.
 - **Ações** — fila de otimizações propostas pela IA. Cada card mostra o alvo, as métricas, o motivo e dois botões: **Aprovar** (executa na Meta) ou **Rejeitar**. A métrica-alvo desta conta é **Checkouts / CTR** (low-ticket, poucas compras).
 - **Campanhas** — drill-down por campanha com métricas e diagnóstico/melhorias da IA.
-- **Criativos** — ranking dos anúncios ativos por CPA/CTR, com análise de imagem + copy (o campeão ganha selo).
+- **Criativos** — ranking dos anúncios ativos por CPA/CTR, com análise de imagem + copy (o campeão ganha selo). Vídeos são marcados com 🎬 e analisados pela **capa (thumbnail) + copy** (o miolo do vídeo não é processado).
+
+### O que a IA analisa
+
+| Elemento | Cobertura |
+|---|---|
+| Imagem do criativo | ✅ visão (a imagem vai pra IA) |
+| Copy + título | ✅ texto |
+| Vídeo | ⚠️ capa (thumbnail) + título/descrição — não frame a frame |
+| Landing page | ✅ texto da página de destino + **coerência anúncio→LP** |
+| Métricas (conta/campanha/anúncio) | ✅ gasto, CTR, checkouts, CPA, ROAS, frequência |
+
+A análise de **landing page** baixa o texto da página de destino de cada anúncio (até 3 páginas por execução) e o relatório traz, na aba **Visão geral**, um diagnóstico por LP com a avaliação de coerência entre a promessa do criativo e o que a página entrega.
 
 ## Otimização (sugerir → autorizar → executar)
 

@@ -14,6 +14,8 @@ const META_API = "https://graph.facebook.com/v21.0";
 const PERIODO = "maximum"; // janela das métricas (date_preset da Meta)
 const MAX_IMAGENS = 6;     // máx. de imagens enviadas à IA por análise
 const MAX_CAMPANHAS = 15;  // máx. de campanhas mandadas à IA / mostradas
+const MAX_LPS = 3;         // máx. de landing pages baixadas e analisadas por run
+const LP_CHARS = 3000;     // tamanho do texto da LP enviado à IA (por página)
 
 // Senha do dashboard. Troque o valor abaixo pela sua senha — é só isso.
 // (Se você preferir, pode definir um secret DASH_KEY no Cloudflare; quando
@@ -507,7 +509,7 @@ async function fetchAds(env) {
   const { token, account } = meta(env);
   const fields =
     "name,effective_status," +
-    "creative{image_url,thumbnail_url,body,title}," +
+    "creative{image_url,thumbnail_url,body,title,video_id,object_story_spec}," +
     "insights.date_preset(" + PERIODO + "){spend,impressions,clicks,ctr,cpc,cpm,frequency,actions,action_values,purchase_roas}";
   const filtering = JSON.stringify([
     { field: "effective_status", operator: "IN", value: ["ACTIVE"] },
@@ -527,13 +529,26 @@ async function fetchAds(env) {
     .filter((a) => a.insights && a.insights.data && a.insights.data[0])
     .map((a) => {
       const m = computeFromInsight(a.insights.data[0]);
+      const c = a.creative || {};
+      const oss = c.object_story_spec || {};
+      const ld = oss.link_data || {};
+      const vd = oss.video_data || {};
+      const isVideo = !!(c.video_id || oss.video_data);
+      const link =
+        ld.link ||
+        (vd.call_to_action && vd.call_to_action.value && vd.call_to_action.value.link) ||
+        (ld.call_to_action && ld.call_to_action.value && ld.call_to_action.value.link) ||
+        null;
       return Object.assign(
         {
           id: a.id,
           name: a.name,
-          image: (a.creative && (a.creative.image_url || a.creative.thumbnail_url)) || null,
-          title: (a.creative && a.creative.title) || "",
-          copy: (a.creative && a.creative.body) || "",
+          format: isVideo ? "video" : "image",
+          link,
+          // Para vídeo, thumbnail_url já é o frame de capa; usamos o que houver.
+          image: c.image_url || c.thumbnail_url || vd.image_url || null,
+          title: c.title || ld.name || vd.title || "",
+          copy: c.body || ld.message || vd.message || "",
         },
         m
       );
@@ -581,7 +596,8 @@ function rankAds(ads) {
 // Envia conta + campanhas + criativos ao Gemini e pede um relatório em JSON
 // Despachante: usa o Claude (Opus 4.8) quando há ANTHROPIC_API_KEY; senão, Gemini.
 async function analyze(env, account, campaigns, ads) {
-  const { systemInstruction, text } = buildAnalysisPrompt(account, campaigns, ads);
+  const landings = await fetchLandingPages(ads);
+  const { systemInstruction, text } = buildAnalysisPrompt(account, campaigns, ads, landings);
   const images = await fetchAdImages(ads);
   if (String(env.ANTHROPIC_API_KEY || "").trim()) {
     return await analyzeWithClaude(env, systemInstruction, text, images);
@@ -590,7 +606,7 @@ async function analyze(env, account, campaigns, ads) {
 }
 
 // Monta o system prompt + o texto com os dados (comum aos dois provedores).
-function buildAnalysisPrompt(account, campaigns, ads) {
+function buildAnalysisPrompt(account, campaigns, ads, landings) {
   const contaResumo = account
     ? {
         gasto: account.spend,
@@ -624,6 +640,8 @@ function buildAnalysisPrompt(account, campaigns, ads) {
     ad_id: a.id,
     nome: a.name,
     rank: a.rank,
+    formato: a.format || "image",
+    link: a.link || null,
     titulo: a.title,
     copy: a.copy ? a.copy.slice(0, 400) : "",
     gasto: a.spend,
@@ -647,6 +665,8 @@ function buildAnalysisPrompt(account, campaigns, ads) {
     "use checkouts como evento-ponte de intenção e CTR como sinal de atração do criativo. Use CPA/ROAS só como apoio. " +
     "Se houver compras mas receita/ROAS vierem zerados, sinalize que o CAPI provavelmente não está enviando o valor da compra. " +
     "Gere uma lista CURTA de sugestões priorizadas e acionáveis.\n\n" +
+    "FORMATO DO CRIATIVO: cada anúncio tem 'formato' (image|video). Para vídeo, a imagem enviada é apenas o FRAME DE CAPA (thumbnail) — avalie a capa e a copy, e não conclua nada sobre o miolo do vídeo que não dê pra inferir da capa.\n" +
+    "LANDING PAGE: quando houver a seção LANDING PAGES, avalie a página de destino (headline, oferta, prova social, clareza do CTA) E principalmente a COERÊNCIA anúncio→página: se a promessa/ângulo do criativo bate com o que a LP entrega. Quebra de coerência aí costuma explicar CTR bom com checkout/compra baixos.\n\n" +
     "ALÉM DISSO, proponha AÇÕES EXECUTÁVEIS no array 'acoes' (no máximo " + MAX_ACOES + ", as mais importantes). Regras rígidas:\n" +
     "- tipo 'pausar': só para anúncio/campanha com gasto relevante E checkouts/CTR claramente ABAIXO da média da conta (perdedor evidente).\n" +
     "- tipo 'escalar': só para vencedor CLARO (melhor checkout-rate/CTR com volume), 'percent' entre " + BUDGET_STEP_MIN + " e " + BUDGET_STEP_MAX + ".\n" +
@@ -661,14 +681,22 @@ function buildAnalysisPrompt(account, campaigns, ads) {
     '"acoes": [ { "nivel": "ad", "target_id": "...", "target_nome": "...", "tipo": "pausar", "percent": null, "motivo": "..." } ], ' +
     '"campanhas": [ { "campaign_id": "...", "diagnostico": "...", "melhorias": ["..."] } ], ' +
     '"vencedor": { "ad_id": "...", "pontos_fortes": ["..."], "melhorias": ["..."] }, ' +
-    '"criativos": [ { "ad_id": "...", "diagnostico": "...", "melhorias": ["..."] } ] }';
+    '"criativos": [ { "ad_id": "...", "diagnostico": "...", "melhorias": ["..."] } ], ' +
+    '"landing_pages": [ { "url": "...", "diagnostico": "...", "coerencia_anuncio_lp": "...", "melhorias": ["..."] } ] }';
+
+  const lpTabela = (landings || []).map((l) => ({
+    url: l.url,
+    ad_id: l.ad_id,
+    texto: l.text,
+  }));
 
   const text =
     "Dados da conta no período (" + PERIODO + "). Anúncios já ranqueados (rank 1 = melhor, por menor CPA " +
     "ou maior CTR). As imagens dos criativos vêm logo abaixo, na ordem do ranking.\n\n" +
     "CONTA:\n" + JSON.stringify(contaResumo, null, 2) +
     "\n\nCAMPANHAS:\n" + JSON.stringify(campanhasTabela, null, 2) +
-    "\n\nANÚNCIOS:\n" + JSON.stringify(adsTabela, null, 2);
+    "\n\nANÚNCIOS:\n" + JSON.stringify(adsTabela, null, 2) +
+    (lpTabela.length ? "\n\nLANDING PAGES (texto extraído das páginas de destino):\n" + JSON.stringify(lpTabela, null, 2) : "");
 
   return { systemInstruction, text };
 }
@@ -689,6 +717,50 @@ async function fetchAdImages(ads) {
     }
   }
   return out;
+}
+
+// Baixa o texto das landing pages de destino (links únicos, na ordem do ranking).
+async function fetchLandingPages(ads) {
+  const seen = new Set();
+  const targets = [];
+  for (const a of ads) {
+    if (a.link && !seen.has(a.link)) {
+      seen.add(a.link);
+      targets.push({ url: a.link, ad_id: a.id });
+      if (targets.length >= MAX_LPS) break;
+    }
+  }
+
+  const out = [];
+  for (const t of targets) {
+    try {
+      const res = await fetch(t.url, {
+        redirect: "follow",
+        headers: { "user-agent": "Mozilla/5.0 (compatible; MetaAdsAnalyst/1.0)" },
+      });
+      const html = await res.text();
+      out.push({ url: t.url, ad_id: t.ad_id, text: htmlToText(html).slice(0, LP_CHARS) });
+    } catch (e) {
+      console.error("Erro ao baixar LP " + t.url + ": ", e.message);
+    }
+  }
+  return out;
+}
+
+// Converte HTML em texto plano (remove script/style/tags, decodifica entidades básicas).
+function htmlToText(html) {
+  return String(html || "")
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 // Extrai o JSON do texto devolvido pela IA (tolera cercas ```json).
@@ -1227,6 +1299,18 @@ const HTML = `<!DOCTYPE html>
     }
     if (an.erro) html += '<div class="resumo"><span class="err">' + esc(an.erro) + '</span></div>';
 
+    var lps = an.landing_pages || [];
+    for (var li = 0; li < lps.length; li++) {
+      var lp = lps[li];
+      html += '<div class="card">';
+      html += '<div class="sec">Landing page</div>';
+      if (lp.url) html += '<div class="rank" style="word-break:break-all">' + esc(lp.url) + '</div>';
+      if (lp.diagnostico) html += '<p class="diag">' + esc(lp.diagnostico) + '</p>';
+      if (lp.coerencia_anuncio_lp) html += '<div class="sec">Coerência anúncio → página</div><p class="diag">' + esc(lp.coerencia_anuncio_lp) + '</p>';
+      if (lp.melhorias && lp.melhorias.length) html += '<div class="sec blue">Melhorias propostas</div>' + listHtml(lp.melhorias);
+      html += '</div>';
+    }
+
     if (!html) html = '<div class="empty">Sem dados ainda. Toque em <b>Rodar análise</b>.</div>';
     app.innerHTML = html;
   }
@@ -1276,7 +1360,8 @@ const HTML = `<!DOCTYPE html>
       html += '<div class="card' + (isChamp ? " champ" : "") + '">';
       if (isChamp) html += '<div class="stamp">Campeão</div>';
       html += '<div class="adname">' + esc(a.name) + '</div>';
-      html += '<div class="rank">Rank ' + a.rank + " de " + ads.length + '</div>';
+      var fmtLabel = a.format === "video" ? " · 🎬 vídeo (capa)" : "";
+      html += '<div class="rank">Rank ' + a.rank + " de " + ads.length + fmtLabel + '</div>';
       if (a.image) html += '<img class="creative" src="' + esc(a.image) + '" alt="Criativo ' + esc(a.name) + '">';
       html += metricsGrid(a);
       if (isChamp && an.vencedor) {
