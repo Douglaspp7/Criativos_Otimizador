@@ -1,12 +1,23 @@
 # Meta Ads Analyst 📊
 
-Painel de métricas do seu negócio no Meta Ads. A cada 12 horas o Worker coleta os insights da **conta inteira**, de **cada campanha** e de **cada anúncio ativo**, guarda um snapshot no banco e o Gemini gera um relatório: saúde da conta, diagnóstico por campanha, veredito dos criativos e uma lista de **sugestões priorizadas** (o que fazer primeiro). Tudo num dashboard mobile com 3 abas.
+Painel de métricas do seu negócio no Meta Ads. A cada 12 horas o Worker coleta os insights da **conta inteira**, de **cada campanha** e de **cada anúncio ativo**, guarda um snapshot no banco e o Gemini gera um relatório: saúde da conta, diagnóstico por campanha, veredito dos criativos e uma lista de **sugestões priorizadas** (o que fazer primeiro). Além de avaliar, ele **propõe ações de otimização** (pausar / escalar / reduzir verba) que você **aprova com 1 toque no celular** — quando aprovadas, são executadas direto na Meta. Tudo num dashboard mobile.
 
 ## O que ele mostra
 
 - **Visão geral** — KPIs da conta (gasto, conversões, CPA, ROAS, CTR, CPM), tendência de gasto ao longo dos snapshots e o resumo + sugestões da IA.
+- **Ações** — fila de otimizações propostas pela IA. Cada card mostra o alvo, as métricas, o motivo e dois botões: **Aprovar** (executa na Meta) ou **Rejeitar**. A métrica-alvo desta conta é **Checkouts / CTR** (low-ticket, poucas compras).
 - **Campanhas** — drill-down por campanha com métricas e diagnóstico/melhorias da IA.
 - **Criativos** — ranking dos anúncios ativos por CPA/CTR, com análise de imagem + copy (o campeão ganha selo).
+
+## Otimização automática (Fase 1: sugerir → aprovar → executar)
+
+A análise gera, junto do relatório, uma lista de **ações executáveis** com guardrails rígidos:
+
+- **pausar** — só para anúncio/campanha com gasto relevante e Checkouts/CTR claramente abaixo da média.
+- **escalar / reduzir verba** — só para vencedor/perdedor claro; o ajuste fica travado entre **10% e 30%** por vez, com piso de verba para não zerar uma campanha.
+- No máximo **5 ações por análise**, sem duplicar o que já está na fila.
+
+Nada é executado sozinho: as ações ficam **pendentes** até você aprovar pelo dashboard. Por isso, para escrever na Meta (pausar, mexer em verba), o `META_TOKEN` precisa de permissão **`ads_management`** (a leitura usa `ads_read`). Toda decisão fica registrada no banco (`actions`).
 
 ## Stack
 
@@ -31,7 +42,7 @@ No Worker criado: **Settings > Variables and Secrets**, adicione como *Secret*:
 
 | Nome | Valor |
 |---|---|
-| `META_TOKEN` | Token do System User com permissão `ads_read` |
+| `META_TOKEN` | Token do System User. `ads_read` basta para avaliar; para **aprovar/executar ações** (pausar, mexer em verba) use `ads_management` |
 | `META_AD_ACCOUNT` | ID da conta no formato `act_1234567890` |
 | `GEMINI_API_KEY` | Sua chave da API do Gemini |
 

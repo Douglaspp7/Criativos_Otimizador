@@ -47,6 +47,15 @@ const DIAS_TENDENCIA = 30; // dias na série de tendência diária (time_increme
 // Modelos do Gemini em ordem de preferência; cai para o próximo se um sumir
 const GEMINI_MODELS = ["gemini-2.5-pro", "gemini-2.5-flash"];
 
+// ---- Otimização (Fase 1: sugerir → você aprova no celular → executa) ----
+// Métrica-alvo desta conta: CHECKOUTS / CTR (low-ticket, poucas compras).
+const METRICA_ALVO = "checkouts_ctr";
+const MAX_ACOES = 5;            // máx. de ações que a IA pode propor por execução
+const BUDGET_STEP_MIN = 10;     // % mínimo de ajuste de verba por vez
+const BUDGET_STEP_MAX = 30;     // % máximo de ajuste de verba por vez (trava de mão)
+const BUDGET_PISO_CENTS = 500;  // verba diária mínima após reduzir (em centavos = R$5,00)
+const ACOES_VALIDAS = ["pausar", "escalar", "reduzir"]; // whitelist de tipos
+
 export default {
   async scheduled(event, env, ctx) {
     ctx.waitUntil(runAnalysis(env).catch((e) => console.error("Cron:", e.message)));
@@ -103,6 +112,41 @@ export default {
           return json(result);
         }
 
+        // Lista as ações pendentes de aprovação (mais novas primeiro)
+        if (url.pathname === "/api/actions") {
+          const rs = await env.DB
+            .prepare(
+              "SELECT id, created_at, level, target_id, target_name, action_type, percent, reason, metric_json " +
+                "FROM actions WHERE status = 'pending' ORDER BY id DESC LIMIT 50"
+            )
+            .all();
+          const acoes = (rs.results || []).map((r) => ({
+            id: r.id,
+            created_at: r.created_at,
+            level: r.level,
+            target_id: r.target_id,
+            target_name: r.target_name,
+            action_type: r.action_type,
+            percent: r.percent,
+            reason: r.reason,
+            metric: safeParse(r.metric_json),
+          }));
+          return json(acoes);
+        }
+
+        // Aprovar (executa na Meta) ou rejeitar uma ação pendente
+        if (url.pathname === "/api/actions/decide" && request.method === "POST") {
+          const bodyTxt = await request.text();
+          const body = safeParse(bodyTxt) || {};
+          const id = Number(body.id);
+          const decision = String(body.decision || "");
+          if (!id || (decision !== "approve" && decision !== "reject")) {
+            return json({ error: "Parâmetros inválidos (id, decision)." }, 400);
+          }
+          const result = await decideAction(env, id, decision);
+          return json(result);
+        }
+
         return json({ error: "Rota não encontrada." }, 404);
       } catch (e) {
         return json({ error: e.message }, 500);
@@ -153,7 +197,7 @@ async function runAnalysis(env) {
     analysis = { erro: "Falha na análise de IA: " + e.message };
   }
 
-  await env.DB
+  const ins = await env.DB
     .prepare(
       "INSERT INTO runs (created_at, account_json, campaigns_json, daily_json, metrics_json, analysis_json) VALUES (?, ?, ?, ?, ?, ?)"
     )
@@ -167,13 +211,100 @@ async function runAnalysis(env) {
     )
     .run();
 
+  const runId = ins?.meta?.last_row_id || null;
+
+  // Fase 1: transforma as ações sugeridas pela IA em itens PENDENTES na fila.
+  let novasAcoes = 0;
+  try {
+    novasAcoes = await enqueueActions(env, runId, analysis, campaigns, ads);
+  } catch (e) {
+    console.error("Fila de ações:", e.message);
+  }
+
   return {
     ok: true,
     campanhas: campaigns.length,
     anuncios: ads.length,
     gasto: account?.spend ?? null,
     vencedor: ads[0]?.name || null,
+    acoes_pendentes: novasAcoes,
   };
+}
+
+// Valida as ações que o Gemini propôs, aplica os guardrails e enfileira como
+// PENDENTES (nada é executado aqui — você aprova depois pelo dashboard).
+async function enqueueActions(env, runId, analysis, campaigns, ads) {
+  const acoes = (analysis && Array.isArray(analysis.acoes)) ? analysis.acoes : [];
+  if (!acoes.length) return 0;
+
+  const adById = {};
+  for (const a of ads) adById[String(a.id)] = a;
+  const campById = {};
+  for (const c of campaigns) campById[String(c.id)] = c;
+
+  // Não duplica: pega o que já está pendente (mesmo alvo + mesmo tipo)
+  const pend = await env.DB
+    .prepare("SELECT target_id, action_type FROM actions WHERE status = 'pending'")
+    .all();
+  const jaPendente = new Set(
+    (pend.results || []).map((r) => r.target_id + "|" + r.action_type)
+  );
+
+  const now = new Date().toISOString();
+  let count = 0;
+
+  for (const raw of acoes.slice(0, MAX_ACOES)) {
+    const tipo = String(raw.tipo || "").toLowerCase();
+    const nivel = raw.nivel === "campaign" ? "campaign" : "ad";
+    const targetId = String(raw.target_id || "").trim();
+    if (!ACOES_VALIDAS.includes(tipo) || !targetId) continue;
+
+    // O alvo precisa existir nos dados coletados (evita id alucinado pela IA)
+    const ref = nivel === "campaign" ? campById[targetId] : adById[targetId];
+    if (!ref) continue;
+
+    if (jaPendente.has(targetId + "|" + tipo)) continue;
+
+    // Clampa o percentual de verba para a faixa segura
+    let percent = null;
+    if (tipo === "escalar" || tipo === "reduzir") {
+      percent = Math.round(Number(raw.percent) || 0);
+      if (!percent) percent = BUDGET_STEP_MIN;
+      percent = Math.max(BUDGET_STEP_MIN, Math.min(BUDGET_STEP_MAX, percent));
+    }
+
+    const snapshot = {
+      gasto: ref.spend,
+      ctr: ref.ctr,
+      checkouts: ref.checkouts,
+      conversoes: ref.conversions,
+      cpa: ref.cpa,
+      frequencia: ref.frequency,
+    };
+
+    await env.DB
+      .prepare(
+        "INSERT INTO actions (run_id, created_at, level, target_id, target_name, action_type, percent, reason, metric_json, status) " +
+          "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')"
+      )
+      .bind(
+        runId,
+        now,
+        nivel,
+        targetId,
+        raw.target_nome || ref.name || "(sem nome)",
+        tipo,
+        percent,
+        String(raw.motivo || ""),
+        JSON.stringify(snapshot)
+      )
+      .run();
+
+    jaPendente.add(targetId + "|" + tipo);
+    count++;
+  }
+
+  return count;
 }
 
 // Insights agregados da conta inteira no período
@@ -379,13 +510,22 @@ async function analyzeWithGemini(env, account, campaigns, ads) {
     "o criativo prevê o público, o targeting é sugestão. Analise a conta como um negócio, não só anúncios. " +
     "Diagnostique a saúde da conta, depois cada campanha relevante (eficiência de gasto, CPA, ROAS, fadiga " +
     "quando frequência > 2,5), e os criativos (o que no visual/título/copy explica o desempenho). " +
-    "Em conta low-ticket com poucas compras, use 'checkouts' (Initiate Checkout) como evento-ponte para ler intenção. " +
-    "Se houver compras mas receita/ROAS vierem zerados, sinalize explicitamente que o CAPI provavelmente não está enviando o valor da compra. " +
-    "Por fim, gere uma lista CURTA de sugestões priorizadas e acionáveis para a conta — o que fazer primeiro.\n\n" +
+    "MÉTRICA-ALVO DESTA CONTA: CHECKOUTS (Initiate Checkout) e CTR — é low-ticket com poucas compras, então " +
+    "use checkouts como evento-ponte de intenção e CTR como sinal de atração do criativo. Use CPA/ROAS só como apoio. " +
+    "Se houver compras mas receita/ROAS vierem zerados, sinalize que o CAPI provavelmente não está enviando o valor da compra. " +
+    "Gere uma lista CURTA de sugestões priorizadas e acionáveis.\n\n" +
+    "ALÉM DISSO, proponha AÇÕES EXECUTÁVEIS no array 'acoes' (no máximo " + MAX_ACOES + ", as mais importantes). Regras rígidas:\n" +
+    "- tipo 'pausar': só para anúncio/campanha com gasto relevante E checkouts/CTR claramente ABAIXO da média da conta (perdedor evidente).\n" +
+    "- tipo 'escalar': só para vencedor CLARO (melhor checkout-rate/CTR com volume), 'percent' entre " + BUDGET_STEP_MIN + " e " + BUDGET_STEP_MAX + ".\n" +
+    "- tipo 'reduzir': para item caro mas ainda não morto, 'percent' entre " + BUDGET_STEP_MIN + " e " + BUDGET_STEP_MAX + ".\n" +
+    "- NUNCA proponha ação para item com dados insuficientes (gasto baixo / poucos dias).\n" +
+    "- 'nivel' é 'ad' (use o ad_id) ou 'campaign' (use o campaign_id). 'percent' é null quando tipo='pausar'.\n" +
+    "- O usuário ainda aprova cada ação no celular antes de executar — seja criterioso, não inunde a fila.\n\n" +
     "Responda SOMENTE com JSON válido, sem markdown, neste formato:\n" +
     '{ "resumo": "visão geral do negócio em 2-3 frases", ' +
     '"saude_conta": "diagnóstico da conta como um todo", ' +
     '"sugestoes_prioritarias": ["ação 1", "ação 2", "ação 3"], ' +
+    '"acoes": [ { "nivel": "ad", "target_id": "...", "target_nome": "...", "tipo": "pausar", "percent": null, "motivo": "..." } ], ' +
     '"campanhas": [ { "campaign_id": "...", "diagnostico": "...", "melhorias": ["..."] } ], ' +
     '"vencedor": { "ad_id": "...", "pontos_fortes": ["..."], "melhorias": ["..."] }, ' +
     '"criativos": [ { "ad_id": "...", "diagnostico": "...", "melhorias": ["..."] } ] }';
@@ -455,6 +595,93 @@ async function analyzeWithGemini(env, account, campaigns, ads) {
   throw new Error("Gemini API: nenhum modelo disponível (" + lastErr + ")");
 }
 
+// ---------------- Executor de ações (Fase 1) ----------------
+
+// Aplica a decisão do usuário sobre uma ação pendente.
+// 'reject' apenas marca; 'approve' executa de verdade na Meta API.
+async function decideAction(env, id, decision) {
+  const row = await env.DB.prepare("SELECT * FROM actions WHERE id = ?").bind(id).first();
+  if (!row) return { ok: false, error: "Ação não encontrada." };
+  if (row.status !== "pending") {
+    return { ok: false, error: "Ação já foi decidida (" + row.status + ")." };
+  }
+
+  const now = new Date().toISOString();
+
+  if (decision === "reject") {
+    await env.DB
+      .prepare("UPDATE actions SET status='rejected', decided_at=? WHERE id=?")
+      .bind(now, id)
+      .run();
+    return { ok: true, status: "rejected" };
+  }
+
+  // approve → executa na Meta e registra o resultado
+  try {
+    const result = await executeAction(env, row);
+    await env.DB
+      .prepare("UPDATE actions SET status='approved', result=?, decided_at=? WHERE id=?")
+      .bind(JSON.stringify(result), now, id)
+      .run();
+    return { ok: true, status: "approved", result };
+  } catch (e) {
+    await env.DB
+      .prepare("UPDATE actions SET status='failed', result=?, decided_at=? WHERE id=?")
+      .bind(String(e.message), now, id)
+      .run();
+    return { ok: false, status: "failed", error: e.message };
+  }
+}
+
+// Traduz a ação aprovada em chamada de escrita na Meta Marketing API.
+// Requer um token com permissão ads_management (read não basta para escrever).
+async function executeAction(env, row) {
+  const { token } = meta(env);
+  if (!token) throw new Error("META_TOKEN ausente.");
+
+  if (row.action_type === "pausar") {
+    return await metaWrite(token, row.target_id, { status: "PAUSED" });
+  }
+
+  if (row.action_type === "escalar" || row.action_type === "reduzir") {
+    const info = await metaRead(token, row.target_id, "name,daily_budget,lifetime_budget,status");
+    const isDaily = info.daily_budget != null;
+    const campo = isDaily ? "daily_budget" : "lifetime_budget";
+    const atual = Number(info.daily_budget || info.lifetime_budget || 0); // centavos
+    if (!atual) {
+      throw new Error("Este alvo não tem orçamento próprio — a verba pode estar no adset ou no CBO em outro nível.");
+    }
+
+    const pct = Number(row.percent) || BUDGET_STEP_MIN;
+    const fator = row.action_type === "escalar" ? 1 + pct / 100 : 1 - pct / 100;
+    let novo = Math.round(atual * fator);
+    if (row.action_type === "reduzir") novo = Math.max(BUDGET_PISO_CENTS, novo);
+
+    const r = await metaWrite(token, row.target_id, { [campo]: String(novo) });
+    return Object.assign({ campo, verba_anterior: atual, verba_nova: novo }, r);
+  }
+
+  throw new Error("Tipo de ação desconhecido: " + row.action_type);
+}
+
+async function metaRead(token, id, fields) {
+  const url = META_API + "/" + id + "?fields=" + encodeURIComponent(fields) + "&access_token=" + token;
+  const res = await fetch(url);
+  const data = await res.json();
+  if (data.error) throw new Error("Meta API (leitura): " + data.error.message);
+  return data;
+}
+
+async function metaWrite(token, id, params) {
+  const form = new URLSearchParams();
+  for (const k in params) form.set(k, params[k]);
+  form.set("access_token", token);
+  const res = await fetch(META_API + "/" + id, { method: "POST", body: form });
+  const data = await res.json();
+  if (data.error) throw new Error("Meta API (escrita): " + data.error.message);
+  return data;
+}
+
 // ---------------- Utilitários ----------------
 
 async function ensureSchema(env) {
@@ -477,6 +704,24 @@ async function ensureSchema(env) {
       /* coluna já existe */
     }
   }
+
+  // Fila de ações propostas pela IA (Fase 1: ficam pendentes até você aprovar)
+  await env.DB.prepare(
+    "CREATE TABLE IF NOT EXISTS actions (" +
+      "id INTEGER PRIMARY KEY AUTOINCREMENT, " +
+      "run_id INTEGER, " +
+      "created_at TEXT NOT NULL, " +
+      "level TEXT, " +           // 'ad' | 'campaign'
+      "target_id TEXT, " +       // id na Meta
+      "target_name TEXT, " +
+      "action_type TEXT, " +     // 'pausar' | 'escalar' | 'reduzir'
+      "percent INTEGER, " +      // % de ajuste de verba (só escalar/reduzir)
+      "reason TEXT, " +          // por que a IA sugeriu
+      "metric_json TEXT, " +     // snapshot das métricas no momento
+      "status TEXT NOT NULL DEFAULT 'pending', " + // pending|approved|rejected|failed
+      "result TEXT, " +          // retorno da execução / erro
+      "decided_at TEXT)"
+  ).run();
 }
 
 // Lê e normaliza credenciais da Meta (remove espaços/aspas/quebras coladas por engano)
@@ -567,6 +812,13 @@ const HTML = `<!DOCTYPE html>
   .trend polyline{fill:none;stroke:var(--blue);stroke-width:2}
   .empty{text-align:center;color:var(--muted);padding:50px 20px}
   .err{color:var(--bad);font-weight:600}
+  .badge{display:inline-block;min-width:18px;text-align:center;background:var(--bad);color:#fff;font-family:'Spline Sans Mono',monospace;font-size:11px;font-weight:600;border-radius:9px;padding:1px 6px;margin-left:2px}
+  .pill{display:inline-block;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.6px;border-radius:6px;padding:3px 8px;margin-bottom:8px}
+  .pill.pausar{background:#FEE4E2;color:var(--bad)} .pill.reduzir{background:#FEF0C7;color:var(--gold)} .pill.escalar{background:#DCFAE6;color:var(--good)}
+  .why{color:var(--muted);font-size:13px;margin:8px 0 12px}
+  .acts{display:flex;gap:8px}
+  .acts .ok{flex:1;background:var(--good);border-color:var(--good)}
+  .acts .no{flex:1;background:var(--card);color:var(--ink)}
   #keybox{display:flex;gap:8px;margin:30px 0}
   #keybox input{flex:1;border:1.5px solid var(--line);border-radius:8px;padding:10px;font-size:15px;font-family:'Spline Sans Mono',monospace}
   .ts{font-size:12px;color:var(--muted)}
@@ -590,6 +842,7 @@ const HTML = `<!DOCTYPE html>
 
 <div id="tabs" class="tabs" style="display:none">
   <button class="tab active" data-tab="overview">Visão geral</button>
+  <button class="tab" data-tab="actions">Ações <span id="actbadge" class="badge" style="display:none">0</span></button>
   <button class="tab" data-tab="campaigns">Campanhas</button>
   <button class="tab" data-tab="creatives">Criativos</button>
 </div>
@@ -600,7 +853,7 @@ const HTML = `<!DOCTYPE html>
 (function(){
   var KEY = localStorage.getItem("dashkey") || "";
   var TAB = "overview";
-  var DATA = null, HISTORY = [];
+  var DATA = null, HISTORY = [], ACTIONS = [];
   var app = document.getElementById("app");
   var keybox = document.getElementById("keybox");
   var tabs = document.getElementById("tabs");
@@ -782,7 +1035,74 @@ const HTML = `<!DOCTYPE html>
     app.innerHTML = html;
   }
 
+  function fmtMetric(m){
+    if (!m) return "";
+    var bits = [];
+    if (m.gasto != null) bits.push("Gasto " + fmt(m.gasto, true));
+    if (m.ctr != null) bits.push("CTR " + fmt(m.ctr) + "%");
+    if (m.checkouts != null) bits.push("Checkouts " + fmt(m.checkouts));
+    if (m.cpa != null) bits.push("CPA " + fmt(m.cpa, true));
+    return bits.join(" · ");
+  }
+
+  function updateBadge(){
+    var b = document.getElementById("actbadge");
+    if (ACTIONS.length) { b.textContent = ACTIONS.length; b.style.display = "inline-block"; }
+    else b.style.display = "none";
+  }
+
+  function decide(id, decision, btn){
+    var card = btn.closest(".card");
+    Array.prototype.forEach.call(card.querySelectorAll("button"), function(x){ x.disabled = true; });
+    btn.textContent = decision === "approve" ? "Aplicando..." : "Removendo...";
+    fetch("/api/actions/decide?key=" + encodeURIComponent(KEY), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ id: id, decision: decision })
+    }).then(function(r){ return r.json(); }).then(function(res){
+      if (res.error) { alert(res.error); }
+      ACTIONS = ACTIONS.filter(function(a){ return a.id !== id; });
+      updateBadge();
+      renderActions();
+    }).catch(function(){
+      alert("Falha de rede ao decidir a ação.");
+      renderActions();
+    });
+  }
+
+  function renderActions(){
+    if (!ACTIONS.length) {
+      app.innerHTML = '<div class="empty">Nenhuma ação pendente. A IA propõe ações (pausar / escalar / reduzir verba) na próxima análise; aqui você aprova ou rejeita.</div>';
+      return;
+    }
+    var html = "";
+    for (var i = 0; i < ACTIONS.length; i++) {
+      var a = ACTIONS[i];
+      var verba = (a.action_type === "escalar" || a.action_type === "reduzir") && a.percent
+        ? (a.action_type === "escalar" ? "+" : "−") + a.percent + "% de verba" : "";
+      var alvo = a.level === "campaign" ? "Campanha" : "Anúncio";
+      html += '<div class="card">';
+      html += '<span class="pill ' + esc(a.action_type) + '">' + esc(a.action_type) + (verba ? " · " + esc(verba) : "") + '</span>';
+      html += '<div class="adname">' + esc(a.target_name) + '</div>';
+      html += '<div class="rank">' + alvo + ' · ' + esc(fmtMetric(a.metric)) + '</div>';
+      html += '<p class="why">' + esc(a.reason) + '</p>';
+      html += '<div class="acts">'
+        + '<button class="ok" data-id="' + a.id + '" data-dec="approve">Aprovar</button>'
+        + '<button class="no" data-id="' + a.id + '" data-dec="reject">Rejeitar</button>'
+        + '</div>';
+      html += '</div>';
+    }
+    app.innerHTML = html;
+    Array.prototype.forEach.call(app.querySelectorAll(".acts button"), function(btn){
+      btn.onclick = function(){ decide(Number(btn.getAttribute("data-id")), btn.getAttribute("data-dec"), btn); };
+    });
+  }
+
   function render(){
+    if (TAB === "actions") { updateBadge(); renderActions();
+      if (DATA) document.getElementById("ts").textContent = "· atualizado " + new Date(DATA.created_at).toLocaleString("pt-BR");
+      return;
+    }
     if (!DATA) {
       app.innerHTML = '<div class="empty">Nenhuma análise ainda. Toque em <b>Rodar análise</b> para gerar a primeira.</div>';
       return;
@@ -801,12 +1121,15 @@ const HTML = `<!DOCTYPE html>
         return r.json();
       }),
       fetch("/api/history?key=" + encodeURIComponent(KEY)).then(function(r){ return r.json(); }).catch(function(){ return []; }),
+      fetch("/api/actions?key=" + encodeURIComponent(KEY)).then(function(r){ return r.json(); }).catch(function(){ return []; }),
     ]).then(function(arr){
       DATA = arr[0];
       HISTORY = arr[1] || [];
+      ACTIONS = Array.isArray(arr[2]) ? arr[2] : [];
       keybox.style.display = "none";
-      tabs.style.display = DATA ? "flex" : "none";
+      tabs.style.display = (DATA || ACTIONS.length) ? "flex" : "none";
       runbtn.style.display = "inline-block";
+      updateBadge();
       render();
     }).catch(function(){});
   }
