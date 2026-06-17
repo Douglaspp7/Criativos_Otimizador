@@ -24,8 +24,9 @@ CREATE TABLE IF NOT EXISTS actions (
   target_name TEXT,
   action_type TEXT,      -- 'pausar' | 'escalar' | 'reduzir'
   percent INTEGER,       -- % de ajuste de verba (escalar/reduzir)
-  reason TEXT,           -- motivo dado pela IA
+  reason TEXT,           -- motivo (da IA ou da regra automática)
   metric_json TEXT,      -- snapshot das métricas no momento da proposta
+  token TEXT,            -- segredo p/ aprovar via link de 1 toque (WhatsApp)
   status TEXT NOT NULL DEFAULT 'pending', -- pending|approved|rejected|failed
   result TEXT,           -- retorno da execução ou mensagem de erro
   decided_at TEXT

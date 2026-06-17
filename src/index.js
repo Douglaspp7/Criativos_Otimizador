@@ -56,6 +56,13 @@ const BUDGET_STEP_MAX = 30;     // % máximo de ajuste de verba por vez (trava d
 const BUDGET_PISO_CENTS = 500;  // verba diária mínima após reduzir (em centavos = R$5,00)
 const ACOES_VALIDAS = ["pausar", "escalar", "reduzir"]; // whitelist de tipos
 
+// ---- Fase 2: detecção automática de perdedores (ainda requer aprovação) ----
+// Regra determinística que propõe PAUSAR anúncios claramente ruins. Nada é
+// pausado sozinho — vira ação pendente e você autoriza pelo WhatsApp/painel.
+const MIN_IMPRESSOES_REGRA = 1000; // abaixo disso, dados insuficientes: não age
+const CTR_FRACO_FRACAO = 0.5;      // CTR < metade do CTR da conta = fraco
+const SPEND_FLOOR_MULT = 2;        // gastou ≥ 2x (CPA da conta OU média) sem retorno
+
 // ---- Notificação por WhatsApp (avisa quando há ação nova pra aprovar) ----
 // Usa o CallMeBot (grátis p/ uso pessoal). Número em formato internacional,
 // só dígitos (sem +, espaço ou traço). A apikey vem do secret CALLMEBOT_APIKEY.
@@ -71,6 +78,31 @@ export default {
 
     if (url.pathname === "/") {
       return new Response(HTML, { headers: { "content-type": "text/html;charset=utf-8" } });
+    }
+
+    // Aprovar/Rejeitar de 1 toque pelo link do WhatsApp (autenticado por token)
+    if (url.pathname === "/act") {
+      await ensureSchema(env);
+      const id = Number(url.searchParams.get("id"));
+      const token = url.searchParams.get("t") || "";
+      const decision = url.searchParams.get("d") || "";
+      if (!id || (decision !== "approve" && decision !== "reject")) {
+        return htmlPage("Link inválido", "Parâmetros faltando ou incorretos.", false);
+      }
+      let res;
+      try {
+        res = await decideActionByToken(env, id, token, decision);
+      } catch (e) {
+        res = { ok: false, error: e.message };
+      }
+      const alvo = res.target_name ? " — " + res.target_name : "";
+      if (res.ok && res.status === "approved") {
+        return htmlPage("✅ Aprovado", "Ação executada na Meta" + alvo + ".", true);
+      }
+      if (res.ok && res.status === "rejected") {
+        return htmlPage("Rejeitado", "A ação foi descartada" + alvo + ".", true);
+      }
+      return htmlPage("Não aplicado", res.error || "Não foi possível concluir.", false);
     }
 
     if (url.pathname.startsWith("/api/")) {
@@ -218,10 +250,15 @@ async function runAnalysis(env) {
 
   const runId = ins?.meta?.last_row_id || null;
 
-  // Fase 1: transforma as ações sugeridas pela IA em itens PENDENTES na fila.
+  // Fase 2: junta as ações da IA com os perdedores detectados pela regra
+  // determinística (ambos só viram propostas PENDENTES — você ainda autoriza).
+  const acoesIA = (analysis && Array.isArray(analysis.acoes)) ? analysis.acoes : [];
+  const acoesRegra = detectLosers(account, ads);
+  const todasAcoes = acoesIA.concat(acoesRegra);
+
   let enfileiradas = [];
   try {
-    enfileiradas = await enqueueActions(env, runId, analysis, campaigns, ads);
+    enfileiradas = await enqueueActions(env, runId, todasAcoes, campaigns, ads);
   } catch (e) {
     console.error("Fila de ações:", e.message);
   }
@@ -245,11 +282,10 @@ async function runAnalysis(env) {
   };
 }
 
-// Valida as ações que o Gemini propôs, aplica os guardrails e enfileira como
-// PENDENTES (nada é executado aqui — você aprova depois pelo dashboard).
-async function enqueueActions(env, runId, analysis, campaigns, ads) {
-  const acoes = (analysis && Array.isArray(analysis.acoes)) ? analysis.acoes : [];
-  if (!acoes.length) return [];
+// Valida as ações propostas (IA + regra), aplica os guardrails e enfileira como
+// PENDENTES (nada é executado aqui — você aprova depois pelo WhatsApp/dashboard).
+async function enqueueActions(env, runId, acoes, campaigns, ads) {
+  if (!Array.isArray(acoes) || !acoes.length) return [];
 
   const adById = {};
   for (const a of ads) adById[String(a.id)] = a;
@@ -295,34 +331,63 @@ async function enqueueActions(env, runId, analysis, campaigns, ads) {
       cpa: ref.cpa,
       frequencia: ref.frequency,
     };
+    const nome = raw.target_nome || ref.name || "(sem nome)";
+    const motivo = String(raw.motivo || "");
+    const token = crypto.randomUUID();
 
-    await env.DB
+    const ins = await env.DB
       .prepare(
-        "INSERT INTO actions (run_id, created_at, level, target_id, target_name, action_type, percent, reason, metric_json, status) " +
-          "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')"
+        "INSERT INTO actions (run_id, created_at, level, target_id, target_name, action_type, percent, reason, metric_json, token, status) " +
+          "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')"
       )
-      .bind(
-        runId,
-        now,
-        nivel,
-        targetId,
-        raw.target_nome || ref.name || "(sem nome)",
-        tipo,
-        percent,
-        String(raw.motivo || ""),
-        JSON.stringify(snapshot)
-      )
+      .bind(runId, now, nivel, targetId, nome, tipo, percent, motivo, JSON.stringify(snapshot), token)
       .run();
 
     jaPendente.add(targetId + "|" + tipo);
     enfileiradas.push({
+      id: ins?.meta?.last_row_id || null,
+      token,
+      level: nivel,
       action_type: tipo,
-      target_name: raw.target_nome || ref.name || "(sem nome)",
+      target_name: nome,
       percent,
+      reason: motivo,
     });
   }
 
   return enfileiradas;
+}
+
+// Regra determinística (Fase 2): aponta anúncios claramente perdedores para
+// PAUSAR. Métrica-alvo: Checkouts/CTR. Conservadora — só age com dados suficientes.
+function detectLosers(account, ads) {
+  const accCtr = account && account.ctr ? account.ctr : null;
+  const accCpa = account && account.cpa ? account.cpa : null;
+  const avgSpend = ads.length ? ads.reduce((s, a) => s + a.spend, 0) / ads.length : 0;
+  const spendFloor = SPEND_FLOOR_MULT * (accCpa || avgSpend);
+
+  const out = [];
+  for (const a of ads) {
+    if (a.impressions < MIN_IMPRESSOES_REGRA) continue; // dados insuficientes
+    if (!spendFloor || a.spend < spendFloor) continue;  // gastou pouco: deixa rodar
+    const semIntencao = a.checkouts === 0 && a.conversions === 0;
+    if (!semIntencao) continue;
+    const ctrFraco = accCtr ? a.ctr < CTR_FRACO_FRACAO * accCtr : false;
+    // Sem CTR de referência, o gasto alto sem nenhum sinal já basta.
+    if (!accCtr || ctrFraco) {
+      out.push({
+        nivel: "ad",
+        target_id: String(a.id),
+        target_nome: a.name,
+        tipo: "pausar",
+        percent: null,
+        motivo:
+          "Regra automática: gastou " + round2(a.spend) + " sem checkouts nem compras" +
+          (ctrFraco ? " e CTR " + a.ctr + "% abaixo da metade da conta (" + accCtr + "%)" : "") + ".",
+      });
+    }
+  }
+  return out;
 }
 
 // Insights agregados da conta inteira no período
@@ -615,13 +680,28 @@ async function analyzeWithGemini(env, account, campaigns, ads) {
 
 // ---------------- Executor de ações (Fase 1) ----------------
 
-// Aplica a decisão do usuário sobre uma ação pendente.
-// 'reject' apenas marca; 'approve' executa de verdade na Meta API.
+// Decisão vinda do dashboard (autenticada pela DASH_KEY): só precisa do id.
 async function decideAction(env, id, decision) {
   const row = await env.DB.prepare("SELECT * FROM actions WHERE id = ?").bind(id).first();
   if (!row) return { ok: false, error: "Ação não encontrada." };
+  return await applyDecision(env, row, decision);
+}
+
+// Decisão vinda do link de 1 toque do WhatsApp: o token autoriza (sem DASH_KEY).
+async function decideActionByToken(env, id, token, decision) {
+  const row = await env.DB.prepare("SELECT * FROM actions WHERE id = ?").bind(id).first();
+  if (!row) return { ok: false, error: "Ação não encontrada." };
+  if (!row.token || !token || row.token !== token) {
+    return { ok: false, error: "Link inválido ou expirado." };
+  }
+  return await applyDecision(env, row, decision);
+}
+
+// Núcleo: aplica a decisão a uma ação pendente.
+// 'reject' apenas marca; 'approve' executa de verdade na Meta API.
+async function applyDecision(env, row, decision) {
   if (row.status !== "pending") {
-    return { ok: false, error: "Ação já foi decidida (" + row.status + ")." };
+    return { ok: false, status: row.status, error: "Ação já foi decidida (" + row.status + ").", target_name: row.target_name, action_type: row.action_type };
   }
 
   const now = new Date().toISOString();
@@ -629,9 +709,9 @@ async function decideAction(env, id, decision) {
   if (decision === "reject") {
     await env.DB
       .prepare("UPDATE actions SET status='rejected', decided_at=? WHERE id=?")
-      .bind(now, id)
+      .bind(now, row.id)
       .run();
-    return { ok: true, status: "rejected" };
+    return { ok: true, status: "rejected", target_name: row.target_name, action_type: row.action_type };
   }
 
   // approve → executa na Meta e registra o resultado
@@ -639,15 +719,15 @@ async function decideAction(env, id, decision) {
     const result = await executeAction(env, row);
     await env.DB
       .prepare("UPDATE actions SET status='approved', result=?, decided_at=? WHERE id=?")
-      .bind(JSON.stringify(result), now, id)
+      .bind(JSON.stringify(result), now, row.id)
       .run();
-    return { ok: true, status: "approved", result };
+    return { ok: true, status: "approved", result, target_name: row.target_name, action_type: row.action_type };
   } catch (e) {
     await env.DB
       .prepare("UPDATE actions SET status='failed', result=?, decided_at=? WHERE id=?")
-      .bind(String(e.message), now, id)
+      .bind(String(e.message), now, row.id)
       .run();
-    return { ok: false, status: "failed", error: e.message };
+    return { ok: false, status: "failed", error: e.message, target_name: row.target_name, action_type: row.action_type };
   }
 }
 
@@ -702,21 +782,31 @@ async function metaWrite(token, id, params) {
 
 // ---------------- Notificação (WhatsApp via CallMeBot) ----------------
 
-// Monta a mensagem listando as ações novas + link do painel (se houver DASH_URL).
+// Monta a mensagem listando as ações novas. Quando há DASH_URL, cada ação vem
+// com link de Aprovar/Rejeitar de 1 toque (autorização direto do WhatsApp).
 function montarAvisoAcoes(env, lista) {
-  const linhas = lista.map((a) => {
+  const base = String(env.DASH_URL || "").trim().replace(/\/+$/, "");
+
+  const blocos = lista.map((a) => {
     const verba =
       (a.action_type === "escalar" || a.action_type === "reduzir") && a.percent
         ? " " + (a.action_type === "escalar" ? "+" : "-") + a.percent + "%"
         : "";
-    return "• " + a.action_type + verba + ": " + a.target_name;
+    let bloco = "• " + a.action_type.toUpperCase() + verba + ": " + a.target_name;
+    if (a.reason) bloco += "\n  " + a.reason;
+    if (base && a.id && a.token) {
+      const q = "id=" + a.id + "&t=" + a.token + "&d=";
+      bloco += "\n  ✅ Aprovar: " + base + "/act?" + q + "approve";
+      bloco += "\n  ❌ Rejeitar: " + base + "/act?" + q + "reject";
+    }
+    return bloco;
   });
-  const link = String(env.DASH_URL || "").trim();
+
   return (
-    "🔔 Meta Ads Analyst\n" +
-    lista.length + " nova(s) ação(ões) aguardando sua aprovação:\n" +
-    linhas.join("\n") +
-    (link ? "\n\nAprovar: " + link : "\n\nAbra o painel para aprovar.")
+    "🔔 Meta Ads Analyst — autorização necessária\n" +
+    lista.length + " ação(ões) propostas:\n\n" +
+    blocos.join("\n\n") +
+    (base ? "" : "\n\nAbra o painel para aprovar/rejeitar.")
   );
 }
 
@@ -772,12 +862,20 @@ async function ensureSchema(env) {
       "target_name TEXT, " +
       "action_type TEXT, " +     // 'pausar' | 'escalar' | 'reduzir'
       "percent INTEGER, " +      // % de ajuste de verba (só escalar/reduzir)
-      "reason TEXT, " +          // por que a IA sugeriu
+      "reason TEXT, " +          // por que a ação foi proposta
       "metric_json TEXT, " +     // snapshot das métricas no momento
+      "token TEXT, " +           // segredo p/ aprovar via link de 1 toque
       "status TEXT NOT NULL DEFAULT 'pending', " + // pending|approved|rejected|failed
       "result TEXT, " +          // retorno da execução / erro
       "decided_at TEXT)"
   ).run();
+
+  // Migração suave: token em bancos antigos
+  try {
+    await env.DB.prepare("ALTER TABLE actions ADD COLUMN token TEXT").run();
+  } catch (e) {
+    /* coluna já existe */
+  }
 }
 
 // Lê e normaliza credenciais da Meta (remove espaços/aspas/quebras coladas por engano)
@@ -812,6 +910,22 @@ function json(obj, status) {
     status: status || 200,
     headers: { "content-type": "application/json;charset=utf-8" },
   });
+}
+
+// Página simples de confirmação para os links de 1 toque do WhatsApp
+function htmlPage(titulo, msg, ok) {
+  const cor = ok ? "#067647" : "#B42318";
+  const esc = (s) => String(s || "").replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+  const body =
+    "<!DOCTYPE html><html lang='pt-BR'><head><meta charset='UTF-8'>" +
+    "<meta name='viewport' content='width=device-width, initial-scale=1'>" +
+    "<title>" + esc(titulo) + "</title></head>" +
+    "<body style='font-family:system-ui,sans-serif;background:#ECEDEA;color:#17191C;margin:0;display:flex;min-height:100vh;align-items:center;justify-content:center;padding:24px'>" +
+    "<div style='background:#fff;border:1.5px solid #D8DAD4;border-radius:16px;padding:28px;max-width:420px;text-align:center'>" +
+    "<h1 style='color:" + cor + ";font-size:22px;margin:0 0 10px'>" + esc(titulo) + "</h1>" +
+    "<p style='color:#6B7280;font-size:15px;margin:0'>" + esc(msg) + "</p>" +
+    "</div></body></html>";
+  return new Response(body, { status: 200, headers: { "content-type": "text/html;charset=utf-8" } });
 }
 
 // ---------------- Dashboard (HTML) ----------------

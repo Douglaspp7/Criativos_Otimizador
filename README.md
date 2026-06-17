@@ -9,7 +9,7 @@ Painel de métricas do seu negócio no Meta Ads. A cada 12 horas o Worker coleta
 - **Campanhas** — drill-down por campanha com métricas e diagnóstico/melhorias da IA.
 - **Criativos** — ranking dos anúncios ativos por CPA/CTR, com análise de imagem + copy (o campeão ganha selo).
 
-## Otimização automática (Fase 1: sugerir → aprovar → executar)
+## Otimização (sugerir → autorizar → executar)
 
 A análise gera, junto do relatório, uma lista de **ações executáveis** com guardrails rígidos:
 
@@ -17,7 +17,9 @@ A análise gera, junto do relatório, uma lista de **ações executáveis** com 
 - **escalar / reduzir verba** — só para vencedor/perdedor claro; o ajuste fica travado entre **10% e 30%** por vez, com piso de verba para não zerar uma campanha.
 - No máximo **5 ações por análise**, sem duplicar o que já está na fila.
 
-Nada é executado sozinho: as ações ficam **pendentes** até você aprovar pelo dashboard. Por isso, para escrever na Meta (pausar, mexer em verba), o `META_TOKEN` precisa de permissão **`ads_management`** (a leitura usa `ads_read`). Toda decisão fica registrada no banco (`actions`).
+**Fase 2 — detecção automática de perdedores.** Além do que o Gemini propõe, uma **regra determinística** varre os anúncios e marca para **pausar** os perdedores claros pela métrica-alvo (Checkouts/CTR): gastou ≥ 2× o CPA da conta (ou a média) **sem nenhum checkout/compra** e, quando há referência, com CTR abaixo da metade da conta. É conservadora — ignora anúncios com menos de 1.000 impressões (dados insuficientes).
+
+**Importante:** mesmo na Fase 2, **nada é pausado sozinho**. Toda ação vira proposta **pendente** e espera sua autorização — pelo dashboard ou pelo **link de 1 toque no WhatsApp**. Por isso, para escrever na Meta (pausar, mexer em verba), o `META_TOKEN` precisa de permissão **`ads_management`** (a leitura usa `ads_read`). Toda decisão fica registrada no banco (`actions`).
 
 ### Aviso no WhatsApp quando há ação nova
 
@@ -28,7 +30,9 @@ Quando a análise gera ações novas, o Worker te manda um WhatsApp listando-as.
 3. Ele responde com sua **apikey**.
 4. No Worker, em **Settings > Variables and Secrets**, adicione o secret `CALLMEBOT_APIKEY` com essa apikey.
 
-Seu número (`+55 13 98875-1089`) já está fixo na constante `WHATSAPP_PHONE` no topo de `src/index.js` — para trocar, edite lá ou defina o secret `WHATSAPP_PHONE` (só dígitos, ex.: `5513988751089`). Opcional: defina o secret `DASH_URL` com a URL do painel para o aviso já vir com o link de aprovação. Sem a `CALLMEBOT_APIKEY`, o aviso é simplesmente ignorado e o resto continua funcionando.
+Seu número (`+55 13 98875-1089`) já está fixo na constante `WHATSAPP_PHONE` no topo de `src/index.js` — para trocar, edite lá ou defina o secret `WHATSAPP_PHONE` (só dígitos, ex.: `5513988751089`). Sem a `CALLMEBOT_APIKEY`, o aviso é simplesmente ignorado e o resto continua funcionando.
+
+**Aprovação por 1 toque:** defina o secret `DASH_URL` com a URL pública do Worker (ex.: `https://criativo-judge.SEU-SUBDOMINIO.workers.dev`). Com ela, cada ação no WhatsApp vem com dois links — **✅ Aprovar** e **❌ Rejeitar**. Tocar em "Aprovar" executa a ação na Meta na hora (rota `/act`, autenticada por um token único por ação, sem expor a senha do painel). Sem `DASH_URL`, o aviso ainda chega, mas você aprova abrindo o dashboard.
 
 ## Stack
 
