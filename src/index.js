@@ -46,6 +46,9 @@ const IC_TYPES = [
 const DIAS_TENDENCIA = 30; // dias na série de tendência diária (time_increment=1)
 // Modelos do Gemini em ordem de preferência; cai para o próximo se um sumir
 const GEMINI_MODELS = ["gemini-2.5-pro", "gemini-2.5-flash"];
+// IA preferida: se houver o secret ANTHROPIC_API_KEY, usa o Claude Opus 4.8;
+// senão, cai no Gemini. (A API da Anthropic é cobrada à parte da assinatura Claude.ai.)
+const CLAUDE_MODEL = "claude-opus-4-8";
 
 // ---- Otimização (Fase 1: sugerir → você aprova no celular → executa) ----
 // Métrica-alvo desta conta: CHECKOUTS / CTR (low-ticket, poucas compras).
@@ -62,6 +65,11 @@ const ACOES_VALIDAS = ["pausar", "escalar", "reduzir"]; // whitelist de tipos
 const MIN_IMPRESSOES_REGRA = 1000; // abaixo disso, dados insuficientes: não age
 const CTR_FRACO_FRACAO = 0.5;      // CTR < metade do CTR da conta = fraco
 const SPEND_FLOOR_MULT = 2;        // gastou ≥ 2x (CPA da conta OU média) sem retorno
+
+// ---- Fase 3: escalar vencedores (também requer aprovação) ----
+const FREQ_FADIGA = 2.5;           // acima disso há fadiga: não escala
+const ESCALAR_PCT_PADRAO = 20;     // % de aumento de verba proposto ao vencedor
+const MAX_ESCALAR_POR_RUN = 1;     // escala no máx. 1 campanha por análise (cautela)
 
 // ---- Notificação por WhatsApp (avisa quando há ação nova pra aprovar) ----
 // Usa o CallMeBot (grátis p/ uso pessoal). Número em formato internacional,
@@ -229,7 +237,7 @@ async function runAnalysis(env) {
 
   let analysis = null;
   try {
-    analysis = await analyzeWithGemini(env, account, campaigns, ads);
+    analysis = await analyze(env, account, campaigns, ads);
   } catch (e) {
     analysis = { erro: "Falha na análise de IA: " + e.message };
   }
@@ -253,7 +261,7 @@ async function runAnalysis(env) {
   // Fase 2: junta as ações da IA com os perdedores detectados pela regra
   // determinística (ambos só viram propostas PENDENTES — você ainda autoriza).
   const acoesIA = (analysis && Array.isArray(analysis.acoes)) ? analysis.acoes : [];
-  const acoesRegra = detectLosers(account, ads);
+  const acoesRegra = detectLosers(account, ads).concat(detectWinners(account, campaigns));
   const todasAcoes = acoesIA.concat(acoesRegra);
 
   let enfileiradas = [];
@@ -388,6 +396,37 @@ function detectLosers(account, ads) {
     }
   }
   return out;
+}
+
+// Regra determinística (Fase 3): aponta a melhor CAMPANHA para ESCALAR verba.
+// Vencedor claro pela métrica-alvo (Checkouts/CTR), com volume e sem fadiga.
+// Escala no nível da campanha (onde fica a verba no CBO). Só propõe — você aprova.
+function detectWinners(account, campaigns) {
+  const accCtr = account && account.ctr ? account.ctr : null;
+
+  const elegiveis = campaigns.filter((c) => {
+    if (c.impressions < MIN_IMPRESSOES_REGRA) return false; // dados insuficientes
+    if (c.frequency && c.frequency > FREQ_FADIGA) return false; // fadiga: não escala
+    const temIntencao = c.checkouts > 0 || c.conversions > 0;
+    const ctrForte = accCtr ? c.ctr >= accCtr : false;
+    return temIntencao && ctrForte; // sinal real + atrai acima da média
+  });
+  if (!elegiveis.length) return [];
+
+  // Melhor primeiro: mais checkouts, depois maior CTR
+  elegiveis.sort((a, b) => (b.checkouts - a.checkouts) || (b.ctr - a.ctr));
+
+  return elegiveis.slice(0, MAX_ESCALAR_POR_RUN).map((c) => ({
+    nivel: "campaign",
+    target_id: String(c.id),
+    target_nome: c.name,
+    tipo: "escalar",
+    percent: ESCALAR_PCT_PADRAO,
+    motivo:
+      "Regra automática: vencedora pela métrica-alvo — " + c.checkouts + " checkouts" +
+      (accCtr ? " e CTR " + c.ctr + "% (acima da conta, " + accCtr + "%)" : "") +
+      ", sem fadiga (freq " + (c.frequency || 0) + ").",
+  }));
 }
 
 // Insights agregados da conta inteira no período
@@ -540,7 +579,18 @@ function rankAds(ads) {
 }
 
 // Envia conta + campanhas + criativos ao Gemini e pede um relatório em JSON
-async function analyzeWithGemini(env, account, campaigns, ads) {
+// Despachante: usa o Claude (Opus 4.8) quando há ANTHROPIC_API_KEY; senão, Gemini.
+async function analyze(env, account, campaigns, ads) {
+  const { systemInstruction, text } = buildAnalysisPrompt(account, campaigns, ads);
+  const images = await fetchAdImages(ads);
+  if (String(env.ANTHROPIC_API_KEY || "").trim()) {
+    return await analyzeWithClaude(env, systemInstruction, text, images);
+  }
+  return await analyzeWithGemini(env, systemInstruction, text, images);
+}
+
+// Monta o system prompt + o texto com os dados (comum aos dois provedores).
+function buildAnalysisPrompt(account, campaigns, ads) {
   const contaResumo = account
     ? {
         gasto: account.spend,
@@ -613,36 +663,79 @@ async function analyzeWithGemini(env, account, campaigns, ads) {
     '"vencedor": { "ad_id": "...", "pontos_fortes": ["..."], "melhorias": ["..."] }, ' +
     '"criativos": [ { "ad_id": "...", "diagnostico": "...", "melhorias": ["..."] } ] }';
 
-  const parts = [
-    {
-      text:
-        "Dados da conta no período (" + PERIODO + "). Anúncios já ranqueados (rank 1 = melhor, por menor CPA " +
-        "ou maior CTR). As imagens dos criativos vêm logo abaixo, na ordem do ranking.\n\n" +
-        "CONTA:\n" + JSON.stringify(contaResumo, null, 2) +
-        "\n\nCAMPANHAS:\n" + JSON.stringify(campanhasTabela, null, 2) +
-        "\n\nANÚNCIOS:\n" + JSON.stringify(adsTabela, null, 2),
-    },
-  ];
+  const text =
+    "Dados da conta no período (" + PERIODO + "). Anúncios já ranqueados (rank 1 = melhor, por menor CPA " +
+    "ou maior CTR). As imagens dos criativos vêm logo abaixo, na ordem do ranking.\n\n" +
+    "CONTA:\n" + JSON.stringify(contaResumo, null, 2) +
+    "\n\nCAMPANHAS:\n" + JSON.stringify(campanhasTabela, null, 2) +
+    "\n\nANÚNCIOS:\n" + JSON.stringify(adsTabela, null, 2);
 
+  return { systemInstruction, text };
+}
+
+// Baixa as imagens dos criativos top e devolve em base64 (comum aos provedores).
+async function fetchAdImages(ads) {
+  const out = [];
   for (const a of ads.slice(0, MAX_IMAGENS)) {
     if (!a.image) continue;
     try {
       const imgRes = await fetch(a.image);
-      const arrBuf = await imgRes.arrayBuffer();
-
+      const bytes = new Uint8Array(await imgRes.arrayBuffer());
       let binary = "";
-      const bytes = new Uint8Array(arrBuf);
-      const len = bytes.byteLength;
-      for (let i = 0; i < len; i++) {
-        binary += String.fromCharCode(bytes[i]);
-      }
-      const base64 = btoa(binary);
-
-      parts.push({ text: "Imagem do criativo rank " + a.rank + " — " + a.name + " (ad_id " + a.id + "):" });
-      parts.push({ inline_data: { mime_type: "image/jpeg", data: base64 } });
+      for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]);
+      out.push({ rank: a.rank, name: a.name, id: a.id, base64: btoa(binary) });
     } catch (e) {
       console.error("Erro ao baixar imagem do ad " + a.id + ": ", e);
     }
+  }
+  return out;
+}
+
+// Extrai o JSON do texto devolvido pela IA (tolera cercas ```json).
+function parseAnalysisJson(text) {
+  const clean = String(text || "{}").replace(/```json|```/g, "").trim();
+  try {
+    return JSON.parse(clean);
+  } catch {
+    return { resumo: clean }; // fallback: guarda o texto bruto
+  }
+}
+
+// --- Provedor: Claude (Opus 4.8) via Anthropic Messages API ---
+async function analyzeWithClaude(env, systemInstruction, text, images) {
+  const content = [{ type: "text", text }];
+  for (const img of images) {
+    content.push({ type: "text", text: "Imagem do criativo rank " + img.rank + " — " + img.name + " (ad_id " + img.id + "):" });
+    content.push({ type: "image", source: { type: "base64", media_type: "image/jpeg", data: img.base64 } });
+  }
+
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-api-key": String(env.ANTHROPIC_API_KEY).trim(),
+      "anthropic-version": "2023-06-01",
+    },
+    body: JSON.stringify({
+      model: CLAUDE_MODEL,
+      max_tokens: 8000,
+      system: systemInstruction + "\nResponda apenas com o objeto JSON, sem texto antes ou depois.",
+      messages: [{ role: "user", content }],
+    }),
+  });
+  const data = await res.json();
+  if (data.error) throw new Error("Claude API: " + (data.error.message || JSON.stringify(data.error)));
+
+  const block = (data.content || []).find((b) => b.type === "text");
+  return parseAnalysisJson(block ? block.text : "{}");
+}
+
+// --- Provedor: Gemini ---
+async function analyzeWithGemini(env, systemInstruction, text, images) {
+  const parts = [{ text }];
+  for (const img of images) {
+    parts.push({ text: "Imagem do criativo rank " + img.rank + " — " + img.name + " (ad_id " + img.id + "):" });
+    parts.push({ inline_data: { mime_type: "image/jpeg", data: img.base64 } });
   }
 
   const body = JSON.stringify({
@@ -661,18 +754,11 @@ async function analyzeWithGemini(env, account, campaigns, ads) {
 
     if (data.error) {
       lastErr = data.error.message;
-      // Modelo indisponível/renomeado → tenta o próximo da lista
       if (/not found|not supported|does not exist/i.test(lastErr)) continue;
       throw new Error("Gemini API: " + lastErr);
     }
 
-    const text = data.candidates?.[0]?.content?.parts?.[0]?.text || "{}";
-    const clean = text.replace(/```json|```/g, "").trim();
-    try {
-      return JSON.parse(clean);
-    } catch {
-      return { resumo: clean }; // fallback: guarda o texto bruto
-    }
+    return parseAnalysisJson(data.candidates?.[0]?.content?.parts?.[0]?.text);
   }
 
   throw new Error("Gemini API: nenhum modelo disponível (" + lastErr + ")");

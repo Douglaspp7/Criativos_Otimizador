@@ -17,9 +17,17 @@ A análise gera, junto do relatório, uma lista de **ações executáveis** com 
 - **escalar / reduzir verba** — só para vencedor/perdedor claro; o ajuste fica travado entre **10% e 30%** por vez, com piso de verba para não zerar uma campanha.
 - No máximo **5 ações por análise**, sem duplicar o que já está na fila.
 
-**Fase 2 — detecção automática de perdedores.** Além do que o Gemini propõe, uma **regra determinística** varre os anúncios e marca para **pausar** os perdedores claros pela métrica-alvo (Checkouts/CTR): gastou ≥ 2× o CPA da conta (ou a média) **sem nenhum checkout/compra** e, quando há referência, com CTR abaixo da metade da conta. É conservadora — ignora anúncios com menos de 1.000 impressões (dados insuficientes).
+**Fase 2 — detecção automática de perdedores.** Além do que a IA propõe, uma **regra determinística** varre os anúncios e marca para **pausar** os perdedores claros pela métrica-alvo (Checkouts/CTR): gastou ≥ 2× o CPA da conta (ou a média) **sem nenhum checkout/compra** e, quando há referência, com CTR abaixo da metade da conta. É conservadora — ignora anúncios com menos de 1.000 impressões (dados insuficientes).
 
-**Importante:** mesmo na Fase 2, **nada é pausado sozinho**. Toda ação vira proposta **pendente** e espera sua autorização — pelo dashboard ou pelo **link de 1 toque no WhatsApp**. Por isso, para escrever na Meta (pausar, mexer em verba), o `META_TOKEN` precisa de permissão **`ads_management`** (a leitura usa `ads_read`). Toda decisão fica registrada no banco (`actions`).
+**Fase 3 — escalar vencedores.** A mesma regra também aponta a **melhor campanha** para **escalar verba (+20%)**: vencedora pela métrica-alvo (mais checkouts e CTR acima da média da conta), com volume e **sem fadiga** (frequência ≤ 2,5). Escala no nível da campanha (onde fica a verba no CBO) e propõe no máximo 1 por análise.
+
+**Importante:** mesmo nas Fases 2 e 3, **nada é pausado ou escalado sozinho**. Toda ação vira proposta **pendente** e espera sua autorização — pelo dashboard ou pelo **link de 1 toque no WhatsApp**.
+
+## IA: Gemini (padrão) ou Claude Opus 4.8
+
+A análise (diagnósticos + ações sugeridas) roda no **Gemini 2.5 Pro** por padrão. Se você adicionar o secret **`ANTHROPIC_API_KEY`** no Worker, ele passa a usar o **Claude Opus 4.8** automaticamente (mesma análise, com visão das imagens).
+
+> ⚠️ **Atenção ao plano:** o acesso à **API da Anthropic é separado** da assinatura do Claude.ai — ter **Claude Pro/Max não habilita a API**. Você precisa de uma **chave de API** com créditos, gerada em `console.anthropic.com` (cobrança pré-paga, à parte). Preço do Opus 4.8: **US$ 5 / 1M tokens de entrada** e **US$ 25 / 1M de saída**; as imagens dos criativos contam como entrada. Para poucas análises/dia com até 6 imagens, fica em centavos a poucos dólares por mês. Por isso, para escrever na Meta (pausar, mexer em verba), o `META_TOKEN` precisa de permissão **`ads_management`** (a leitura usa `ads_read`). Toda decisão fica registrada no banco (`actions`).
 
 ### Aviso no WhatsApp quando há ação nova
 
@@ -39,7 +47,7 @@ Seu número (`+55 13 98875-1089`) já está fixo na constante `WHATSAPP_PHONE` n
 - **Cloudflare Worker** com Cron Trigger (análise automática 2x/dia)
 - **D1** (banco SQLite da Cloudflare) para histórico — a tabela é criada e migrada sozinha
 - **Meta Marketing API** (insights em 3 níveis: conta, campanha, anúncio + imagem/copy dos criativos)
-- **Gemini 2.5 Pro** (relatório qualitativo com visão)
+- **Gemini 2.5 Pro** (padrão) ou **Claude Opus 4.8** (se `ANTHROPIC_API_KEY` estiver definido) — relatório qualitativo com visão
 
 ## Instalação (100% pelo celular)
 
@@ -59,7 +67,8 @@ No Worker criado: **Settings > Variables and Secrets**, adicione como *Secret*:
 |---|---|
 | `META_TOKEN` | Token do System User. `ads_read` basta para avaliar; para **aprovar/executar ações** (pausar, mexer em verba) use `ads_management` |
 | `META_AD_ACCOUNT` | ID da conta no formato `act_1234567890` |
-| `GEMINI_API_KEY` | Sua chave da API do Gemini |
+| `GEMINI_API_KEY` | Sua chave da API do Gemini (usada quando não há `ANTHROPIC_API_KEY`) |
+| `ANTHROPIC_API_KEY` | *(opcional)* chave da API da Anthropic (`console.anthropic.com`) — quando presente, usa o **Claude Opus 4.8** no lugar do Gemini |
 | `CALLMEBOT_APIKEY` | *(opcional)* apikey do CallMeBot para receber o aviso no WhatsApp — veja a seção acima |
 | `DASH_URL` | *(opcional)* URL do painel, para o aviso de WhatsApp vir com o link de aprovação |
 
